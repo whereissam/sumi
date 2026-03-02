@@ -2,6 +2,18 @@ import en from '../../i18n/en.json';
 import zhTW from '../../i18n/zh-TW.json';
 import zhCN from '../../i18n/zh-CN.json';
 
+type Translations = Record<string, string>;
+
+// Lazy-load every locale EXCEPT the three that are statically imported above.
+// Using negation patterns tells Vite these files are never in the dynamic path,
+// which eliminates the "dynamically imported but also statically imported" warnings.
+const lazyLocales = import.meta.glob<Translations>([
+  '../../i18n/*.json',
+  '!../../i18n/en.json',
+  '!../../i18n/zh-TW.json',
+  '!../../i18n/zh-CN.json',
+], { import: 'default' });
+
 const SUPPORTED = [
   'en', 'zh-TW', 'zh-CN',
   'af', 'ar', 'hy', 'az', 'be', 'bs', 'bg', 'ca',
@@ -14,8 +26,6 @@ const SUPPORTED = [
 ] as const;
 
 const FALLBACK = 'en';
-
-type Translations = Record<string, string>;
 
 const locales: Record<string, Translations> = {
   en: en as Translations,
@@ -52,9 +62,11 @@ export function getLocale(): string {
 
 async function loadLocale(locale: string): Promise<Translations | null> {
   if (locales[locale]) return locales[locale];
+  const key = `../../i18n/${locale}.json`;
+  if (!(key in lazyLocales)) return null;
   try {
-    const mod = await import(`../../i18n/${locale}.json`);
-    locales[locale] = mod.default as Translations;
+    const translations = await lazyLocales[key]();
+    locales[locale] = translations;
     return locales[locale];
   } catch {
     return null;
