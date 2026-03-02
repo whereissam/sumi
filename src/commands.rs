@@ -1395,8 +1395,9 @@ pub fn switch_whisper_model(app: AppHandle, state: State<'_, AppState>, model: W
         crate::transcribe::warm_whisper_cache(&state.whisper_ctx, &model)
     }));
 
-    // Always clear flag and hide overlay regardless of warm outcome.
-    state.model_switching.store(false, Ordering::SeqCst);
+    // Emit "done" and hide overlay on the main thread, then clear the flag —
+    // keeping model_switching=true until the UI transition is finished so the
+    // hotkey cannot fire in the gap between warm completion and overlay hide.
     {
         let app2 = app.clone();
         let _ = app.run_on_main_thread(move || {
@@ -1404,6 +1405,7 @@ pub fn switch_whisper_model(app: AppHandle, state: State<'_, AppState>, model: W
                 let _ = ov.emit("model-switching", serde_json::json!({"status": "done"}));
                 platform::hide_overlay(&ov);
             }
+            app2.state::<AppState>().model_switching.store(false, Ordering::SeqCst);
         });
     }
 
@@ -1944,8 +1946,7 @@ pub fn switch_qwen3_asr_model(
             qwen3::warm_qwen3_asr(&state.qwen3_asr_ctx, &model)
         }));
 
-        // Always clear flag and hide overlay.
-        state.model_switching.store(false, Ordering::SeqCst);
+        // Emit "done" and hide overlay on the main thread, then clear the flag.
         {
             let app2 = app.clone();
             let _ = app.run_on_main_thread(move || {
@@ -1953,6 +1954,7 @@ pub fn switch_qwen3_asr_model(
                     let _ = ov.emit("model-switching", serde_json::json!({"status": "done"}));
                     platform::hide_overlay(&ov);
                 }
+                app2.state::<AppState>().model_switching.store(false, Ordering::SeqCst);
             });
         }
 

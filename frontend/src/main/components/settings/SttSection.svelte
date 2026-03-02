@@ -152,8 +152,9 @@
       await switchWhisperModel(modelId);
     } catch (e) {
       console.error('Failed to switch whisper model:', e);
-      setSttWhisperModel(prevModelId); // revert optimistic update on failure
+      if (!destroyed) setSttWhisperModel(prevModelId); // revert optimistic update on failure
     }
+    if (destroyed) return;
     whisperSwitching = false;
     await loadModels();
   }
@@ -213,8 +214,9 @@
       await switchQwen3AsrModel(modelId);
     } catch (e) {
       console.error('Failed to switch Qwen3-ASR model:', e);
-      setSttQwen3AsrModel(prevModelId ?? 'qwen3_asr1_7_b'); // revert optimistic update on failure
+      if (!destroyed) setSttQwen3AsrModel(prevModelId ?? 'qwen3_asr1_7_b'); // revert optimistic update on failure
     }
+    if (destroyed) return;
     qwen3Switching = false;
     await loadQwen3Models();
   }
@@ -306,12 +308,15 @@
     }
   });
 
+  let destroyed = false;
+
   onMount(() => {
     loadModels();
     loadQwen3Models();
   });
 
   onDestroy(() => {
+    destroyed = true;
     if (unlisten) { unlisten(); unlisten = null; }
     if (vadUnlisten) { vadUnlisten(); vadUnlisten = null; }
     if (qwen3Unlisten) { qwen3Unlisten(); qwen3Unlisten = null; }

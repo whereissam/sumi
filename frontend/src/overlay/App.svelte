@@ -56,6 +56,7 @@
   let timerInterval: ReturnType<typeof setInterval> | null = null;
   let undoTimeout: ReturnType<typeof setTimeout> | null = null;
   let editedTimeout: ReturnType<typeof setTimeout> | null = null;
+  let switchingTimeout: ReturnType<typeof setTimeout> | null = null;
 
   // ── Undo bar element for reflow trick ──
   let undoBarEl: HTMLDivElement | undefined = $state();
@@ -207,10 +208,18 @@
     }
   }
 
+  function clearSwitchingTimeout() {
+    if (switchingTimeout) {
+      clearTimeout(switchingTimeout);
+      switchingTimeout = null;
+    }
+  }
+
   // ── State transitions ──
   function clearCommon() {
     clearUndoTimeout();
     clearEditedTimeout();
+    clearSwitchingTimeout();
     stopTimer();
     stopWaveform();
     undoAnimating = false;
@@ -404,9 +413,15 @@
       if (p.status === 'start') {
         clearCommon();
         phase = 'switching';
+        // Safety net: if backend crashes before emitting "done", reset after 30s
+        switchingTimeout = setTimeout(() => {
+          switchingTimeout = null;
+          if (phase === 'switching') setPreparing();
+        }, 30_000);
       } else if (p.status === 'done') {
         // Reset directly — do not rely on visibilitychange, which is not
         // triggered by alpha-zero hiding (alpha=0 ≠ document.hidden in WKWebView).
+        clearSwitchingTimeout();
         setPreparing();
       }
     });
@@ -419,6 +434,7 @@
     stopWaveform();
     clearUndoTimeout();
     clearEditedTimeout();
+    clearSwitchingTimeout();
     for (const unlisten of unlisteners) {
       unlisten();
     }
