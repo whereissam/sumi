@@ -138,6 +138,13 @@ pub fn warm_whisper_cache(
         .lock()
         .unwrap_or_else(|e| e.into_inner());
 
+    // Already loaded with the right model? No-op.
+    if let Some(ref c) = *cache_guard {
+        if c.loaded_path == model_path {
+            return Ok(());
+        }
+    }
+
     let load_start = Instant::now();
     tracing::info!("Pre-warming Whisper model: {} ...", model.display_name());
 

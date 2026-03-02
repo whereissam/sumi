@@ -31,7 +31,6 @@
     downloadQwen3AsrModel,
     onQwen3AsrDownloadProgress,
     saveApiKey,
-    getApiKey,
   } from '$lib/api';
   import type {
     SttMode,
@@ -56,21 +55,20 @@
   let models = $state<WhisperModelInfo[]>([]);
   let recommendedModel = $state<WhisperModelId | null>(null);
   let whisperSwitching = $state(false);
-  let downloadingModelId = $state<WhisperModelId | null>(null);
-  let downloadPercent = $state(0);
-  let downloadedBytes = $state(0);
-  let totalBytes = $state(0);
-  let downloadError = $state(false);
-  let unlisten: UnlistenFn | null = null;
 
   // ── Qwen3-ASR model state ──
 
   let qwen3Models = $state<Qwen3AsrModelInfo[]>([]);
   let qwen3Switching = $state(false);
-  let qwen3DownloadingModelId = $state<Qwen3AsrModelId | null>(null);
-  let qwen3DownloadPercent = $state(0);
-  let qwen3DownloadError = $state(false);
-  let qwen3Unlisten: UnlistenFn | null = null;
+
+  // ── Local model download state (shared by Whisper and Qwen3-ASR) ──
+
+  let downloadingModelId = $state<string | null>(null);
+  let downloadPercent = $state(0);
+  let downloadedBytes = $state(0);
+  let totalBytes = $state(0);
+  let downloadErrorModelId = $state<string | null>(null);
+  let unlisten: UnlistenFn | null = null;
 
   // ── VAD state ──
 
@@ -121,10 +119,10 @@
     { value: 'cloud', label: t('settings.stt.modeCloud') },
   ]);
 
-  let localEngineOptions = $derived([
+  const localEngineOptions = [
     { value: 'whisper', label: 'Whisper' },
     { value: 'qwen3_asr', label: 'Qwen3-ASR' },
-  ]);
+  ];
 
   let sttConfig = $derived(getSttConfig());
 
@@ -161,7 +159,7 @@
 
   async function startWhisperDownload(modelId: WhisperModelId) {
     downloadingModelId = modelId;
-    downloadError = false;
+    downloadErrorModelId = null;
     downloadPercent = 0;
     downloadedBytes = 0;
     totalBytes = 0;
@@ -180,7 +178,7 @@
         loadModels();
       } else if (d.status === 'error') {
         downloadingModelId = null;
-        downloadError = true;
+        downloadErrorModelId = modelId;
         console.error('Whisper model download error:', d.message);
         if (unlisten) { unlisten(); unlisten = null; }
       }
@@ -190,7 +188,7 @@
       await downloadWhisperModel(modelId);
     } catch (e) {
       downloadingModelId = null;
-      downloadError = true;
+      downloadErrorModelId = modelId;
       console.error('Failed to start whisper model download:', e);
     }
   }
@@ -222,33 +220,37 @@
   }
 
   async function startQwen3Download(modelId: Qwen3AsrModelId) {
-    qwen3DownloadingModelId = modelId;
-    qwen3DownloadError = false;
-    qwen3DownloadPercent = 0;
+    downloadingModelId = modelId;
+    downloadErrorModelId = null;
+    downloadPercent = 0;
+    downloadedBytes = 0;
+    totalBytes = 0;
 
-    if (qwen3Unlisten) { qwen3Unlisten(); qwen3Unlisten = null; }
+    if (unlisten) { unlisten(); unlisten = null; }
 
-    qwen3Unlisten = await onQwen3AsrDownloadProgress((d) => {
+    unlisten = await onQwen3AsrDownloadProgress((d) => {
       if (d.status === 'complete') {
-        qwen3DownloadingModelId = null;
-        if (qwen3Unlisten) { qwen3Unlisten(); qwen3Unlisten = null; }
+        downloadingModelId = null;
+        if (unlisten) { unlisten(); unlisten = null; }
         loadQwen3Models();
       } else if (d.status === 'error') {
-        qwen3DownloadingModelId = null;
-        qwen3DownloadError = true;
+        downloadingModelId = null;
+        downloadErrorModelId = modelId;
         console.error('Qwen3-ASR download error:', d.message);
-        if (qwen3Unlisten) { qwen3Unlisten(); qwen3Unlisten = null; }
+        if (unlisten) { unlisten(); unlisten = null; }
       } else {
         const pct = d.downloaded && d.total ? (d.downloaded / d.total) * 100 : 0;
-        qwen3DownloadPercent = Math.min(pct, 100);
+        downloadPercent = Math.min(pct, 100);
+        downloadedBytes = d.downloaded ?? 0;
+        totalBytes = d.total ?? 0;
       }
     });
 
     try {
       await downloadQwen3AsrModel(modelId);
     } catch (e) {
-      qwen3DownloadingModelId = null;
-      qwen3DownloadError = true;
+      downloadingModelId = null;
+      downloadErrorModelId = modelId;
       console.error('Failed to start Qwen3-ASR download:', e);
     }
   }
@@ -319,7 +321,6 @@
     destroyed = true;
     if (unlisten) { unlisten(); unlisten = null; }
     if (vadUnlisten) { vadUnlisten(); vadUnlisten = null; }
-    if (qwen3Unlisten) { qwen3Unlisten(); qwen3Unlisten = null; }
   });
 </script>
 
@@ -390,11 +391,12 @@
             {@const isDownloading = downloadingModelId === model.id}
             {@const isRecommended = model.id === recommendedModel}
             {@const isSwitchingThis = whisperSwitching && isActive}
+            {@const isError = model.id === downloadErrorModelId}
             <!-- svelte-ignore a11y_no_static_element_interactions -->
             <div
               class="model-row"
               class:active={isActive}
-              class:disabled={(!model.downloaded && !isDownloading) || whisperSwitching}
+              class:disabled={(!model.downloaded && !isDownloading && !isError) || whisperSwitching}
               onclick={() => !whisperSwitching && model.downloaded && onSelectModel(model.id)}
               onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); !whisperSwitching && model.downloaded && onSelectModel(model.id); } }}
               role="radio"
@@ -427,6 +429,11 @@
                   </span>
                 {:else if isDownloading}
                   <span class="model-downloading-label">{Math.round(downloadPercent)}%</span>
+                {:else if isError}
+                  <button
+                    class="model-retry-btn"
+                    onclick={(e) => { e.stopPropagation(); startWhisperDownload(model.id); }}
+                  >{t('settings.stt.retry')}</button>
                 {:else}
                   <button
                     class="model-download-btn"
@@ -458,13 +465,14 @@
         <div class="model-list" class:switching={qwen3Switching}>
           {#each qwen3Models as model (model.id)}
             {@const isActive = model.id === (sttConfig.qwen3_asr_model ?? 'qwen3_asr1_7_b')}
-            {@const isThisDownloading = model.id === qwen3DownloadingModelId}
+            {@const isThisDownloading = model.id === downloadingModelId}
             {@const isSwitchingThis = qwen3Switching && isActive}
+            {@const isError = model.id === downloadErrorModelId}
             <!-- svelte-ignore a11y_no_static_element_interactions -->
             <div
               class="model-row"
               class:active={isActive}
-              class:disabled={(!model.downloaded && !isThisDownloading) || qwen3Switching}
+              class:disabled={(!model.downloaded && !isThisDownloading && !isError) || qwen3Switching}
               onclick={() => !qwen3Switching && model.downloaded && onSelectQwen3Model(model.id)}
               onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); !qwen3Switching && model.downloaded && onSelectQwen3Model(model.id); } }}
               role="radio"
@@ -493,7 +501,12 @@
                     </svg>
                   </span>
                 {:else if isThisDownloading}
-                  <span class="model-downloading-label">{Math.round(qwen3DownloadPercent)}%</span>
+                  <span class="model-downloading-label">{Math.round(downloadPercent)}%</span>
+                {:else if isError}
+                  <button
+                    class="model-retry-btn"
+                    onclick={(e) => { e.stopPropagation(); startQwen3Download(model.id); }}
+                  >{t('settings.stt.retry')}</button>
                 {:else}
                   <button
                     class="model-download-btn"
@@ -508,8 +521,9 @@
             {#if isThisDownloading}
               <div class="model-progress-wrap">
                 <ProgressBar
-                  percent={qwen3DownloadPercent}
-                  label="{Math.round(qwen3DownloadPercent)}%"
+                  percent={downloadPercent}
+                  label="{Math.round(downloadPercent)}%"
+                  sublabel="{formatSize(downloadedBytes)} / {formatSize(totalBytes)}"
                   shimmer
                 />
               </div>
@@ -706,6 +720,26 @@
 
   .model-download-btn:hover {
     background: #0066d6;
+  }
+
+  .model-retry-btn {
+    -webkit-app-region: no-drag;
+    app-region: no-drag;
+    padding: 4px 12px;
+    border: none;
+    border-radius: var(--radius-sm);
+    background: #ff3b30;
+    color: #ffffff;
+    font-family: 'Inter', sans-serif;
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s ease;
+    white-space: nowrap;
+  }
+
+  .model-retry-btn:hover {
+    background: #d63027;
   }
 
   .model-progress-wrap {

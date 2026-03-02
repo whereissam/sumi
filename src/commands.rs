@@ -1143,6 +1143,11 @@ pub fn list_polish_models(state: State<'_, AppState>) -> Vec<PolishModelInfo> {
 
 #[tauri::command]
 pub fn switch_polish_model(state: State<'_, AppState>, model: polisher::PolishModel) -> Result<(), String> {
+    // Guard: refuse if recording or processing is already in progress.
+    if state.is_recording.load(Ordering::SeqCst) || state.is_processing.load(Ordering::SeqCst) {
+        return Err("Cannot switch model while recording or processing".to_string());
+    }
+
     {
         let mut settings = state.settings.lock().map_err(|e| e.to_string())?;
         settings.polish.model = model.clone();

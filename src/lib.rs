@@ -25,7 +25,6 @@ use tauri::{
     AppHandle, Emitter, Manager,
 };
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
-use whisper_rs::WhisperContextParameters;
 
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -807,33 +806,9 @@ pub fn run() {
                     if stt_mode == SttMode::Local {
                         match local_engine {
                             stt::LocalSttEngine::Whisper => {
-                                if let Ok(model_path) = transcribe::whisper_model_path_for(&whisper_model) {
-                                    let mut ctx_guard = match state.whisper_ctx.lock() {
-                                        Ok(g) => g,
-                                        Err(_) => {
-                                            tracing::error!("whisper_ctx mutex poisoned, skipping pre-warm");
-                                            return;
-                                        }
-                                    };
-                                    if ctx_guard.is_none() {
-                                        tracing::info!("Pre-warming Whisper model: {}...", whisper_model.display_name());
-                                        let mut ctx_params = WhisperContextParameters::new();
-                                        ctx_params.use_gpu(true);
-                                        match whisper_rs::WhisperContext::new_with_params(
-                                            model_path.to_str().unwrap_or_default(),
-                                            ctx_params,
-                                        ) {
-                                            Ok(ctx) => {
-                                                *ctx_guard = Some(transcribe::WhisperContextCache {
-                                                    ctx,
-                                                    loaded_path: model_path.clone(),
-                                                });
-                                                tracing::info!("Whisper model pre-warmed ({:.0?})", warmup_start.elapsed());
-                                            }
-                                            Err(e) => {
-                                                tracing::error!("Whisper pre-warm failed: {}", e);
-                                            }
-                                        }
+                                if transcribe::whisper_model_path_for(&whisper_model).is_ok() {
+                                    if let Err(e) = transcribe::warm_whisper_cache(&state.whisper_ctx, &whisper_model) {
+                                        tracing::error!("Whisper pre-warm failed: {}", e);
                                     }
                                 }
                             }
@@ -1130,6 +1105,56 @@ pub fn run() {
                                     Ok(()) => {
                                         tracing::info!("🎙️ Recording started (app: {:?}, bundle: {:?}, url: {:?})",
                                             captured_ctx.app_name, captured_ctx.bundle_id, captured_ctx.url);
+
+                                        // Recording-start warm: load models in parallel with the user speaking.
+                                        // If startup pre-warm already finished, the guard in each warm function
+                                        // makes this a no-op. If the startup warm is still running, the mutex
+                                        // serialises the two threads so no double-load occurs.
+                                        {
+                                            let warm_app = app.clone();
+                                            let (stt_mode, whisper_model, local_engine, qwen3_model, polish_mode, polish_model) =
+                                                state.settings.lock()
+                                                    .map(|s| (
+                                                        s.stt.mode.clone(),
+                                                        s.stt.whisper_model.clone(),
+                                                        s.stt.local_engine.clone(),
+                                                        s.stt.qwen3_asr_model.clone(),
+                                                        s.polish.mode.clone(),
+                                                        s.polish.model.clone(),
+                                                    ))
+                                                    .unwrap_or_default();
+                                            std::thread::spawn(move || {
+                                                let state = warm_app.state::<AppState>();
+                                                if stt_mode == SttMode::Local {
+                                                    match local_engine {
+                                                        stt::LocalSttEngine::Whisper => {
+                                                            if let Err(e) = transcribe::warm_whisper_cache(
+                                                                &state.whisper_ctx, &whisper_model,
+                                                            ) {
+                                                                tracing::warn!("Recording-start warm (Whisper) skipped: {}", e);
+                                                            }
+                                                        }
+                                                        stt::LocalSttEngine::Qwen3Asr => {
+                                                            if let Err(e) = qwen3_asr::warm_qwen3_asr(
+                                                                &state.qwen3_asr_ctx, &qwen3_model,
+                                                            ) {
+                                                                tracing::warn!("Recording-start warm (Qwen3-ASR) skipped: {}", e);
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                if polish_mode == polisher::PolishMode::Local {
+                                                    let model_dir = models_dir();
+                                                    if model_dir.join(polish_model.filename()).exists() {
+                                                        if let Err(e) = polisher::warm_llm_cache(
+                                                            &state.llm_model, &model_dir, &polish_model,
+                                                        ) {
+                                                            tracing::warn!("Recording-start warm (LLM) skipped: {}", e);
+                                                        }
+                                                    }
+                                                }
+                                            });
+                                        }
 
                                         if let Ok(mut ctx) = state.captured_context.lock() {
                                             *ctx = Some(captured_ctx);
