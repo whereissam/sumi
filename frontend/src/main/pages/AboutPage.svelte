@@ -121,17 +121,19 @@
 
   type DiagState = 'idle' | 'exporting' | 'done' | 'error';
   let diagState = $state<DiagState>('idle');
+  let diagResetTimer: ReturnType<typeof setTimeout> | null = null;
 
   async function handleExportDiag() {
-    if (diagState === 'exporting') return;
+    if (diagState === 'exporting' || diagState === 'done') return;
+    if (diagResetTimer !== null) { clearTimeout(diagResetTimer); diagResetTimer = null; }
     diagState = 'exporting';
     try {
       await exportDiagnosticLog();
       diagState = 'done';
-      setTimeout(() => { diagState = 'idle'; }, 3000);
+      diagResetTimer = setTimeout(() => { diagState = 'idle'; diagResetTimer = null; }, 3000);
     } catch {
       diagState = 'error';
-      setTimeout(() => { diagState = 'idle'; }, 3000);
+      diagResetTimer = setTimeout(() => { diagState = 'idle'; diagResetTimer = null; }, 3000);
     }
   }
 </script>
@@ -185,7 +187,7 @@
     <div class="about-diag">
       <button
         class="about-update-btn"
-        disabled={diagState === 'exporting'}
+        disabled={diagState === 'exporting' || diagState === 'done'}
         onclick={handleExportDiag}
       >
         {#if diagState === 'exporting'}
