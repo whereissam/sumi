@@ -20,6 +20,9 @@ import type {
   PolishModel,
   Qwen3AsrModelInfo,
   Qwen3AsrModelId,
+  TranscriptionPartialPayload,
+  MeetingNote,
+  PolishedMeetingNote,
 } from './types';
 
 // ── Settings ──
@@ -34,6 +37,9 @@ export const updateHotkey = (hotkey: string) =>
 
 export const updateEditHotkey = (hotkey: string) =>
   invoke<void>('update_edit_hotkey', { hotkey });
+
+export const updateMeetingHotkey = (hotkey: string | null) =>
+  invoke<void>('update_meeting_hotkey', { hotkey });
 
 export const resetSettings = () => invoke<void>('reset_settings');
 
@@ -135,6 +141,11 @@ export const onRecordingMaxDuration = (cb: (secs: number) => void): Promise<Unli
 
 export const onAudioLevels = (cb: (levels: number[]) => void): Promise<UnlistenFn> =>
   listen<number[]>('audio-levels', (e) => cb(e.payload));
+
+export const onTranscriptionPartial = (
+  cb: (payload: TranscriptionPartialPayload) => void,
+): Promise<UnlistenFn> =>
+  listen<TranscriptionPartialPayload>('transcription-partial', (e) => cb(e.payload));
 
 export const onTranscriptionResult = (cb: (text: string) => void): Promise<UnlistenFn> =>
   listen<string>('transcription-result', (e) => cb(e.payload));
@@ -241,7 +252,61 @@ export const onQwen3AsrDownloadProgress = (
 ): Promise<UnlistenFn> =>
   listen('qwen3-asr-download-progress', (e) => cb(e.payload as DownloadProgress & { current_file?: string; file_index?: number; file_count?: number }));
 
+// ── Model deletion ──
+
+export const deleteWhisperModel = (model: WhisperModelId) =>
+  invoke<number>('delete_whisper_model', { model });
+
+export const deletePolishModel = (model: PolishModel) =>
+  invoke<number>('delete_polish_model', { model });
+
+export const deleteQwen3AsrModel = (model: Qwen3AsrModelId) =>
+  invoke<number>('delete_qwen3_asr_model', { model });
+
+export const deleteVadModel = () =>
+  invoke<number>('delete_vad_model');
+
 export const onModelSwitching = (
   cb: (p: { status: 'start' | 'done' }) => void,
 ): Promise<UnlistenFn> =>
   listen('model-switching', (e) => cb(e.payload as { status: 'start' | 'done' }));
+
+// ── Meeting Notes ──
+
+export const listMeetingNotes = () =>
+  invoke<MeetingNote[]>('list_meeting_notes');
+
+export const getMeetingNote = (id: string) =>
+  invoke<MeetingNote>('get_meeting_note', { id });
+
+export const renameMeetingNote = (id: string, title: string) =>
+  invoke<void>('rename_meeting_note', { id, title });
+
+export const deleteMeetingNote = (id: string) =>
+  invoke<void>('delete_meeting_note', { id });
+
+export const deleteAllMeetingNotes = () =>
+  invoke<void>('delete_all_meeting_notes');
+
+export const getActiveMeetingNoteId = () =>
+  invoke<string | null>('get_active_meeting_note_id');
+
+export const onMeetingNoteCreated = (
+  cb: (p: { id: string; note: MeetingNote }) => void,
+): Promise<UnlistenFn> =>
+  listen('meeting-note-created', (e) => cb(e.payload as { id: string; note: MeetingNote }));
+
+export const onMeetingNoteUpdated = (
+  cb: (p: { id: string; delta: string; duration_secs: number }) => void,
+): Promise<UnlistenFn> =>
+  listen('meeting-note-updated', (e) =>
+    cb(e.payload as { id: string; delta: string; duration_secs: number }),
+  );
+
+export const polishMeetingNote = (id: string) =>
+  invoke<PolishedMeetingNote>('polish_meeting_note', { id });
+
+export const onMeetingNoteFinalized = (
+  cb: (p: { id: string }) => void,
+): Promise<UnlistenFn> =>
+  listen('meeting-note-finalized', (e) => cb(e.payload as { id: string }));

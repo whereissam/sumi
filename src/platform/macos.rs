@@ -1,12 +1,12 @@
-use std::ffi::c_void;
+use std::ffi::{c_char, c_void};
 
 extern "C" {
-    fn sel_registerName(name: *const u8) -> *mut c_void;
+    fn sel_registerName(name: *const c_char) -> *mut c_void;
     fn objc_msgSend();
-    fn objc_getClass(name: *const u8) -> *mut c_void;
+    fn objc_getClass(name: *const c_char) -> *mut c_void;
     fn objc_allocateClassPair(
         superclass: *mut c_void,
-        name: *const u8,
+        name: *const c_char,
         extra_bytes: usize,
     ) -> *mut c_void;
     fn objc_registerClassPair(cls: *mut c_void);
@@ -15,16 +15,15 @@ extern "C" {
 
 /// Hide the Dock icon by setting the activation policy to Accessory.
 /// NSApplicationActivationPolicyAccessory = 1
+///
+/// # Safety
+/// Calls ObjC runtime through raw pointers. Must be called from the main thread.
 pub unsafe fn set_accessory_policy() {
-    let cls_name = b"NSApplication\0";
-    let sel_shared = sel_registerName(b"sharedApplication\0".as_ptr());
+    let sel_shared = sel_registerName(c"sharedApplication".as_ptr());
     let send_shared: unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
         std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
 
-    let class_sel = sel_registerName(b"class\0".as_ptr());
-    let _ = class_sel;
-
-    let ns_app_class = objc_getClass(cls_name.as_ptr());
+    let ns_app_class = objc_getClass(c"NSApplication".as_ptr());
     if ns_app_class.is_null() {
         return;
     }
@@ -33,7 +32,7 @@ pub unsafe fn set_accessory_policy() {
         return;
     }
 
-    let sel_policy = sel_registerName(b"setActivationPolicy:\0".as_ptr());
+    let sel_policy = sel_registerName(c"setActivationPolicy:".as_ptr());
     let send_policy: unsafe extern "C" fn(*mut c_void, *mut c_void, i64) =
         std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
     send_policy(ns_app, sel_policy, 1); // 1 = Accessory
@@ -46,8 +45,11 @@ pub unsafe fn set_accessory_policy() {
 /// the full window.  Setting `isMovableByWindowBackground = YES` lets the
 /// user drag the window by clicking anywhere that is not an interactive
 /// control.
+///
+/// # Safety
+/// `ns_window` must be a valid, non-null NSWindow pointer.
 pub unsafe fn set_movable_by_background(ns_window: *mut c_void) {
-    let sel = sel_registerName(b"setMovableByWindowBackground:\0".as_ptr());
+    let sel = sel_registerName(c"setMovableByWindowBackground:".as_ptr());
     let send: unsafe extern "C" fn(*mut c_void, *mut c_void, i8) =
         std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
     send(ns_window, sel, 1); // YES
@@ -66,14 +68,13 @@ const OVERLAY_BEHAVIOR: u64 = 1    // canJoinAllSpaces
 /// runtime class that inherits from NSPanel and swap the window's
 /// isa pointer so the window server treats it as a panel.
 unsafe fn make_panel(ns_window: *mut c_void) {
-    let panel_class_name = b"SumiOverlayPanel\0".as_ptr();
-    let mut cls = objc_getClass(panel_class_name);
+    let mut cls = objc_getClass(c"SumiOverlayPanel".as_ptr());
     if cls.is_null() {
-        let ns_panel = objc_getClass(b"NSPanel\0".as_ptr());
+        let ns_panel = objc_getClass(c"NSPanel".as_ptr());
         if ns_panel.is_null() {
             return;
         }
-        cls = objc_allocateClassPair(ns_panel, panel_class_name, 0);
+        cls = objc_allocateClassPair(ns_panel, c"SumiOverlayPanel".as_ptr(), 0);
         if cls.is_null() {
             return;
         }
@@ -82,24 +83,24 @@ unsafe fn make_panel(ns_window: *mut c_void) {
     object_setClass(ns_window, cls);
 
     // NSPanel-specific: don't become key unless user explicitly clicks
-    let sel = sel_registerName(b"setBecomesKeyOnlyIfNeeded:\0".as_ptr());
+    let sel = sel_registerName(c"setBecomesKeyOnlyIfNeeded:".as_ptr());
     let send: unsafe extern "C" fn(*mut c_void, *mut c_void, i8) =
         std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
     send(ns_window, sel, 1);
 
     // NSPanel-specific: treat as a floating panel
-    let sel = sel_registerName(b"setFloatingPanel:\0".as_ptr());
+    let sel = sel_registerName(c"setFloatingPanel:".as_ptr());
     let send: unsafe extern "C" fn(*mut c_void, *mut c_void, i8) =
         std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
     send(ns_window, sel, 1);
 
     // Add non-activating panel to style mask (bit 7 = 128)
-    let sel_mask = sel_registerName(b"styleMask\0".as_ptr());
+    let sel_mask = sel_registerName(c"styleMask".as_ptr());
     let get_mask: unsafe extern "C" fn(*mut c_void, *mut c_void) -> u64 =
         std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
     let mask = get_mask(ns_window, sel_mask);
 
-    let sel_set = sel_registerName(b"setStyleMask:\0".as_ptr());
+    let sel_set = sel_registerName(c"setStyleMask:".as_ptr());
     let set_mask: unsafe extern "C" fn(*mut c_void, *mut c_void, u64) =
         std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
     set_mask(ns_window, sel_set, mask | (1 << 7)); // NSWindowStyleMaskNonactivatingPanel
@@ -107,77 +108,86 @@ unsafe fn make_panel(ns_window: *mut c_void) {
 
 /// One-time setup: convert to NSPanel, floating level, stays visible
 /// when app deactivates, joins all Spaces (including fullscreen).
+///
+/// # Safety
+/// `ns_window` must be a valid, non-null NSWindow pointer. Must be called
+/// on the main thread during window setup.
 pub unsafe fn setup_overlay(ns_window: *mut c_void) {
     // Convert NSWindow → NSPanel so it can appear in fullscreen Spaces
     make_panel(ns_window);
 
     // setLevel: kCGPopUpMenuWindowLevel (101) — above fullscreen windows
-    let sel = sel_registerName(b"setLevel:\0".as_ptr());
+    let sel = sel_registerName(c"setLevel:".as_ptr());
     let send: unsafe extern "C" fn(*mut c_void, *mut c_void, i64) =
         std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
     send(ns_window, sel, 101);
 
     // setHidesOnDeactivate: NO
-    let sel = sel_registerName(b"setHidesOnDeactivate:\0".as_ptr());
+    let sel = sel_registerName(c"setHidesOnDeactivate:".as_ptr());
     let send: unsafe extern "C" fn(*mut c_void, *mut c_void, i8) =
         std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
     send(ns_window, sel, 0);
 
     // setCollectionBehavior
-    let sel = sel_registerName(b"setCollectionBehavior:\0".as_ptr());
+    let sel = sel_registerName(c"setCollectionBehavior:".as_ptr());
     let send: unsafe extern "C" fn(*mut c_void, *mut c_void, u64) =
         std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
     send(ns_window, sel, OVERLAY_BEHAVIOR);
 
     // Register with window server immediately (alpha=0 so invisible),
     // ensuring the window joins all Spaces from the start.
-    let sel = sel_registerName(b"setAlphaValue:\0".as_ptr());
+    let sel = sel_registerName(c"setAlphaValue:".as_ptr());
     let send: unsafe extern "C" fn(*mut c_void, *mut c_void, f64) =
         std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
     send(ns_window, sel, 0.0);
 
-    let sel = sel_registerName(b"setIgnoresMouseEvents:\0".as_ptr());
+    let sel = sel_registerName(c"setIgnoresMouseEvents:".as_ptr());
     let send: unsafe extern "C" fn(*mut c_void, *mut c_void, i8) =
         std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
     send(ns_window, sel, 1);
 
     // Order front while invisible to register with all Spaces immediately
-    let sel = sel_registerName(b"orderFrontRegardless\0".as_ptr());
+    let sel = sel_registerName(c"orderFrontRegardless".as_ptr());
     let send: unsafe extern "C" fn(*mut c_void, *mut c_void) =
         std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
     send(ns_window, sel);
-
 }
 
 /// Show without activating the application.
+///
+/// # Safety
+/// `ns_window` must be a valid, non-null NSWindow pointer.
 pub unsafe fn show_no_activate(ns_window: *mut c_void) {
     // Accept mouse events
-    let sel = sel_registerName(b"setIgnoresMouseEvents:\0".as_ptr());
+    let sel = sel_registerName(c"setIgnoresMouseEvents:".as_ptr());
     let send: unsafe extern "C" fn(*mut c_void, *mut c_void, i8) =
         std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
     send(ns_window, sel, 0);
 
     // Make visible
-    let sel = sel_registerName(b"setAlphaValue:\0".as_ptr());
+    let sel = sel_registerName(c"setAlphaValue:".as_ptr());
     let send: unsafe extern "C" fn(*mut c_void, *mut c_void, f64) =
         std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
     send(ns_window, sel, 1.0);
 
     // Bring to front without activating
-    let sel = sel_registerName(b"orderFrontRegardless\0".as_ptr());
+    let sel = sel_registerName(c"orderFrontRegardless".as_ptr());
     let send: unsafe extern "C" fn(*mut c_void, *mut c_void) =
         std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
     send(ns_window, sel);
 }
 
 /// Hide the overlay (alpha-based, stays in window server for all Spaces).
+///
+/// # Safety
+/// `ns_window` must be a valid, non-null NSWindow pointer.
 pub unsafe fn hide_window(ns_window: *mut c_void) {
-    let sel = sel_registerName(b"setAlphaValue:\0".as_ptr());
+    let sel = sel_registerName(c"setAlphaValue:".as_ptr());
     let send: unsafe extern "C" fn(*mut c_void, *mut c_void, f64) =
         std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
     send(ns_window, sel, 0.0);
 
-    let sel = sel_registerName(b"setIgnoresMouseEvents:\0".as_ptr());
+    let sel = sel_registerName(c"setIgnoresMouseEvents:".as_ptr());
     let send: unsafe extern "C" fn(*mut c_void, *mut c_void, i8) =
         std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
     send(ns_window, sel, 1);
@@ -229,12 +239,16 @@ unsafe fn simulate_cmd_key(virtual_key: u16) -> bool {
 }
 
 /// Convert an NSString pointer to a Rust String.
+///
+/// # Safety
+/// `nsstr` must be a valid NSString pointer or null. A null pointer returns an
+/// empty string.
 pub unsafe fn nsstring_to_string(nsstr: *mut c_void) -> String {
     if nsstr.is_null() {
         return String::new();
     }
 
-    let sel_utf8 = sel_registerName(b"UTF8String\0".as_ptr());
+    let sel_utf8 = sel_registerName(c"UTF8String".as_ptr());
     let send_cstr: unsafe extern "C" fn(*mut c_void, *mut c_void) -> *const i8 =
         std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
     let cstr_ptr = send_cstr(nsstr, sel_utf8);
@@ -248,10 +262,19 @@ pub unsafe fn nsstring_to_string(nsstr: *mut c_void) -> String {
 }
 
 /// Simulate Cmd+V (paste).
+///
+/// # Safety
+/// Posts CGEvents; must be called from a context where CGEvent posting is allowed.
 pub unsafe fn simulate_cmd_v() -> bool { simulate_cmd_key(9) }
 /// Simulate Cmd+C (copy).
+///
+/// # Safety
+/// Posts CGEvents; must be called from a context where CGEvent posting is allowed.
 pub unsafe fn simulate_cmd_c() -> bool { simulate_cmd_key(8) }
 /// Simulate Cmd+Z (undo).
+///
+/// # Safety
+/// Posts CGEvents; must be called from a context where CGEvent posting is allowed.
 pub unsafe fn simulate_cmd_z() -> bool { simulate_cmd_key(6) }
 
 // ── CoreAudio: Bluetooth input detection & device-change listener ────────────
@@ -313,6 +336,7 @@ const K_ELEMENT_MAIN: u32              = 0;
 const K_TRANSPORT_BLUETOOTH: u32        = 0x626c7565; // 'blue'
 const K_TRANSPORT_BLUETOOTH_LE: u32     = 0x626c6574; // 'blet'
 const K_TRANSPORT_BUILT_IN: u32         = 0x626c746e; // 'bltn'
+const K_TRANSPORT_VIRTUAL: u32          = 0x7672746c; // 'vrtl'
 const K_CF_STRING_UTF8: u32             = 0x08000100;
 
 /// Convert a CFStringRef to a Rust `String`.
@@ -350,7 +374,7 @@ pub fn is_default_input_bluetooth() -> bool {
         );
         if status != 0 || device_id == 0 { return false; }
 
-        // Get transport type of that device
+        // Method 1: transport type (works on macOS ≤ 15).
         let addr_t = AudioObjectPropertyAddress {
             selector: K_AUDIO_PROP_TRANSPORT_TYPE,
             scope: K_SCOPE_GLOBAL,
@@ -363,8 +387,22 @@ pub fn is_default_input_bluetooth() -> bool {
             0, std::ptr::null(),
             &mut size2, &mut transport as *mut u32 as *mut c_void,
         );
-        if status2 != 0 { return false; }
-        transport == K_TRANSPORT_BLUETOOTH || transport == K_TRANSPORT_BLUETOOTH_LE
+        if status2 == 0 {
+            return transport == K_TRANSPORT_BLUETOOTH || transport == K_TRANSPORT_BLUETOOTH_LE;
+        }
+
+        // Method 2: UID heuristic (macOS 16+ where transport type is unavailable).
+        // Bluetooth devices have UIDs like "XX-XX-XX-XX-XX-XX:input" where the
+        // prefix is a MAC address (6 colon-separated hex pairs when decoded).
+        let uid = get_cfstring_property(device_id, K_AUDIO_PROP_UID);
+        if let Some(prefix) = uid.split(':').next() {
+            // MAC address format: 12 hex chars with dashes, e.g. "50-F3-51-E6-A1-09"
+            let parts: Vec<&str> = prefix.split('-').collect();
+            if parts.len() == 6 && parts.iter().all(|p| p.len() == 2 && p.chars().all(|c| c.is_ascii_hexdigit())) {
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -372,7 +410,6 @@ pub fn is_default_input_bluetooth() -> bool {
 /// with at least one input stream). Returns `None` if none exists.
 pub fn get_builtin_input_device_name() -> Option<String> {
     unsafe {
-        // Enumerate all device IDs
         let addr_devs = AudioObjectPropertyAddress {
             selector: K_AUDIO_PROP_DEVICES,
             scope: K_SCOPE_GLOBAL,
@@ -396,20 +433,7 @@ pub fn get_builtin_input_device_name() -> Option<String> {
         if s2 != 0 { return None; }
 
         for &dev_id in &ids {
-            // Must be built-in transport
-            let addr_t = AudioObjectPropertyAddress {
-                selector: K_AUDIO_PROP_TRANSPORT_TYPE,
-                scope: K_SCOPE_GLOBAL,
-                element: K_ELEMENT_MAIN,
-            };
-            let mut transport: u32 = 0;
-            let mut ts = std::mem::size_of::<u32>() as u32;
-            let r = AudioObjectGetPropertyData(
-                dev_id, &addr_t,
-                0, std::ptr::null(),
-                &mut ts, &mut transport as *mut u32 as *mut c_void,
-            );
-            if r != 0 || transport != K_TRANSPORT_BUILT_IN { continue; }
+            if !is_builtin_device(dev_id) { continue; }
 
             // Must have at least one input stream
             let addr_streams = AudioObjectPropertyAddress {
@@ -424,7 +448,143 @@ pub fn get_builtin_input_device_name() -> Option<String> {
             );
             if rs != 0 || stream_size == 0 { continue; }
 
-            // Get device name (returned as CFStringRef)
+            let name = get_cfstring_property(dev_id, K_AUDIO_PROP_NAME);
+            if !name.is_empty() { return Some(name); }
+        }
+        None
+    }
+}
+
+/// Check whether a CoreAudio device is built-in.
+unsafe fn is_builtin_device(dev_id: u32) -> bool {
+    // Method 1: transport type (works on macOS ≤ 15).
+    let addr_t = AudioObjectPropertyAddress {
+        selector: K_AUDIO_PROP_TRANSPORT_TYPE,
+        scope: K_SCOPE_GLOBAL,
+        element: K_ELEMENT_MAIN,
+    };
+    let mut transport: u32 = 0;
+    let mut ts = std::mem::size_of::<u32>() as u32;
+    let r = AudioObjectGetPropertyData(
+        dev_id, &addr_t,
+        0, std::ptr::null(),
+        &mut ts, &mut transport as *mut u32 as *mut c_void,
+    );
+    if r == 0 {
+        return transport == K_TRANSPORT_BUILT_IN;
+    }
+
+    // Method 2: UID heuristic (macOS 16+).
+    let uid = get_cfstring_property(dev_id, K_AUDIO_PROP_UID);
+    uid.starts_with("BuiltIn")
+}
+
+const K_AUDIO_PROP_UID: u32             = 0x75696420; // 'uid '
+const K_AUDIO_PROP_MANUFACTURER: u32    = 0x6c6d616b; // 'lmak'
+
+/// Check whether a CoreAudio device is virtual (loopback driver).
+///
+/// Uses a two-tier strategy:
+/// 1. `kAudioDevicePropertyTransportType == 'vrtl'` (works on macOS ≤ 15)
+/// 2. Fallback (macOS 16+, where transport type is unavailable): checks that
+///    the manufacturer is NOT "Apple Inc." and the UID lacks hardware
+///    identifiers (MAC-address pattern, "BuiltIn" prefix, or UUID dashes).
+unsafe fn is_virtual_device(dev_id: u32) -> bool {
+    // Method 1: transport type (reliable on older macOS).
+    let addr_t = AudioObjectPropertyAddress {
+        selector: K_AUDIO_PROP_TRANSPORT_TYPE,
+        scope: K_SCOPE_GLOBAL,
+        element: K_ELEMENT_MAIN,
+    };
+    let mut transport: u32 = 0;
+    let mut ts = std::mem::size_of::<u32>() as u32;
+    let r = AudioObjectGetPropertyData(
+        dev_id, &addr_t,
+        0, std::ptr::null(),
+        &mut ts, &mut transport as *mut u32 as *mut c_void,
+    );
+    if r == 0 {
+        return transport == K_TRANSPORT_VIRTUAL;
+    }
+
+    // Method 2: manufacturer + UID heuristic (macOS 16+).
+    let uid = get_cfstring_property(dev_id, K_AUDIO_PROP_UID);
+    let mfr = get_cfstring_property(dev_id, K_AUDIO_PROP_MANUFACTURER);
+
+    let is_apple = mfr == "Apple Inc.";
+    // Physical devices typically have hardware UIDs: "XX-XX-XX:input", "BuiltIn*", or UUID-style dashes.
+    let has_hw_uid = uid.contains(':') || uid.starts_with("BuiltIn") || uid.contains('-');
+
+    !is_apple && !has_hw_uid
+}
+
+/// Read a CFString property from a CoreAudio object.
+unsafe fn get_cfstring_property(dev_id: u32, selector: u32) -> String {
+    let addr = AudioObjectPropertyAddress {
+        selector,
+        scope: K_SCOPE_GLOBAL,
+        element: K_ELEMENT_MAIN,
+    };
+    let mut cf_str: *mut c_void = std::ptr::null_mut();
+    let mut sz = std::mem::size_of::<*mut c_void>() as u32;
+    let r = AudioObjectGetPropertyData(
+        dev_id, &addr,
+        0, std::ptr::null(),
+        &mut sz, &mut cf_str as *mut *mut c_void as *mut c_void,
+    );
+    if r != 0 || cf_str.is_null() { return String::new(); }
+    let s = cfstring_to_string(cf_str);
+    CFRelease(cf_str);
+    s
+}
+
+/// List names of all non-virtual audio input devices (i.e. physical mics).
+///
+/// Filters out virtual loopback drivers (BlackHole, Loopback, Speaker Audio
+/// Recorder, etc.) using transport type on macOS ≤ 15 and a manufacturer/UID
+/// heuristic on macOS 16+ where transport type is unavailable.
+pub fn list_physical_input_device_names() -> Vec<String> {
+    unsafe {
+        let addr_devs = AudioObjectPropertyAddress {
+            selector: K_AUDIO_PROP_DEVICES,
+            scope: K_SCOPE_GLOBAL,
+            element: K_ELEMENT_MAIN,
+        };
+        let mut data_size: u32 = 0;
+        let s = AudioObjectGetPropertyDataSize(
+            K_AUDIO_OBJECT_SYSTEM, &addr_devs,
+            0, std::ptr::null(), &mut data_size,
+        );
+        if s != 0 || data_size == 0 { return Vec::new(); }
+
+        let count = data_size as usize / std::mem::size_of::<u32>();
+        let mut ids: Vec<u32> = vec![0u32; count];
+        let mut actual = data_size;
+        let s2 = AudioObjectGetPropertyData(
+            K_AUDIO_OBJECT_SYSTEM, &addr_devs,
+            0, std::ptr::null(),
+            &mut actual, ids.as_mut_ptr() as *mut c_void,
+        );
+        if s2 != 0 { return Vec::new(); }
+
+        let mut names = Vec::new();
+        for &dev_id in &ids {
+            if is_virtual_device(dev_id) { continue; }
+
+            // Must have at least one input stream.
+            let addr_streams = AudioObjectPropertyAddress {
+                selector: K_AUDIO_PROP_STREAMS,
+                scope: K_SCOPE_INPUT,
+                element: K_ELEMENT_MAIN,
+            };
+            let mut stream_size: u32 = 0;
+            let rs = AudioObjectGetPropertyDataSize(
+                dev_id, &addr_streams,
+                0, std::ptr::null(), &mut stream_size,
+            );
+            if rs != 0 || stream_size == 0 { continue; }
+
+            // Get device name.
             let addr_name = AudioObjectPropertyAddress {
                 selector: K_AUDIO_PROP_NAME,
                 scope: K_SCOPE_GLOBAL,
@@ -441,9 +601,9 @@ pub fn get_builtin_input_device_name() -> Option<String> {
 
             let name = cfstring_to_string(cf_str);
             CFRelease(cf_str);
-            if !name.is_empty() { return Some(name); }
+            if !name.is_empty() { names.push(name); }
         }
-        None
+        names
     }
 }
 
@@ -493,17 +653,17 @@ pub fn add_default_input_listener(callback: impl Fn() + Send + 'static) {
 /// when the selected text is identical to the previously saved clipboard content).
 pub fn clipboard_change_count() -> Option<u32> {
     unsafe {
-        let cls = objc_getClass(b"NSPasteboard\0".as_ptr());
+        let cls = objc_getClass(c"NSPasteboard".as_ptr());
         if cls.is_null() { return None; }
 
-        let sel_general = sel_registerName(b"generalPasteboard\0".as_ptr());
+        let sel_general = sel_registerName(c"generalPasteboard".as_ptr());
         type MsgSendPb = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
-        let pb = std::mem::transmute::<_, MsgSendPb>(objc_msgSend as *const ())(cls, sel_general);
+        let pb = std::mem::transmute::<*const (), MsgSendPb>(objc_msgSend as *const ())(cls, sel_general);
         if pb.is_null() { return None; }
 
-        let sel_count = sel_registerName(b"changeCount\0".as_ptr());
+        let sel_count = sel_registerName(c"changeCount".as_ptr());
         type MsgSendCount = unsafe extern "C" fn(*mut c_void, *mut c_void) -> i64;
-        let count = std::mem::transmute::<_, MsgSendCount>(objc_msgSend as *const ())(pb, sel_count);
+        let count = std::mem::transmute::<*const (), MsgSendCount>(objc_msgSend as *const ())(pb, sel_count);
         Some(count as u32)
     }
 }

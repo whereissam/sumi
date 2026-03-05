@@ -6,6 +6,7 @@
     onRecordingMaxDuration,
     onAudioLevels,
     onModelSwitching,
+    onTranscriptionPartial,
     triggerUndo,
     getSettings,
   } from '$lib/api';
@@ -28,6 +29,8 @@
     | 'preparing'
     | 'recording'
     | 'edit_recording'
+    | 'meeting_recording'
+    | 'meeting_stopped'
     | 'processing'
     | 'transcribing'
     | 'polishing'
@@ -44,6 +47,7 @@
   let recProgress: number = $state(0);
   let maxDuration: number = $state(30);
   let undoAnimating: boolean = $state(false);
+  let partialText: string = $state('');
 
   // ── Canvas & waveform ──
   let canvasEl: HTMLCanvasElement | undefined = $state();
@@ -71,9 +75,13 @@
       case 'preparing':
         return 'capsule preparing';
       case 'recording':
-        return 'capsule recording';
+        return partialText.length > 0 ? 'capsule recording has-partial' : 'capsule recording';
       case 'edit_recording':
         return 'capsule edit-recording';
+      case 'meeting_recording':
+        return 'capsule meeting-recording';
+      case 'meeting_stopped':
+        return 'capsule result success';
       case 'processing':
         return 'capsule processing';
       case 'transcribing':
@@ -105,6 +113,10 @@
         return t('overlay.recording');
       case 'edit_recording':
         return t('overlay.editRecording');
+      case 'meeting_recording':
+        return t('overlay.meetingRecording');
+      case 'meeting_stopped':
+        return t('overlay.meetingStopped');
       case 'processing':
       case 'transcribing':
         return t('overlay.transcribing');
@@ -137,15 +149,19 @@
 
   let showDot: boolean = $derived.by(() => false); // dot is never shown in practice (CSS handles it on .recording)
   let showSpinner: boolean = $derived.by(() => is('preparing', 'processing', 'transcribing', 'polishing', 'switching'));
-  let showWaveform: boolean = $derived.by(() => is('recording', 'edit_recording'));
-  let showIconResult: boolean = $derived.by(() => is('pasted', 'copied', 'error', 'edit_requires_polish', 'edited'));
-  let showTimer: boolean = $derived.by(() => is('recording', 'edit_recording'));
+  let showWaveform: boolean = $derived.by(() => is('recording', 'edit_recording', 'meeting_recording'));
+  let showIconResult: boolean = $derived.by(() => is('pasted', 'copied', 'error', 'edit_requires_polish', 'edited', 'meeting_stopped'));
+  let showTimer: boolean = $derived.by(() => is('recording', 'edit_recording', 'meeting_recording'));
   let showUndoIcon: boolean = $derived.by(() => is('undo'));
   let showUndoBar: boolean = $derived.by(() => is('undo'));
-  let isCheckIcon: boolean = $derived.by(() => is('pasted', 'copied', 'edited'));
+  let isCheckIcon: boolean = $derived.by(() => is('pasted', 'copied', 'edited', 'meeting_stopped'));
   let isErrorIcon: boolean = $derived.by(() => is('error', 'edit_requires_polish'));
   let isPolishSpinner: boolean = $derived.by(() => is('polishing'));
   let isSwitchingSpinner: boolean = $derived.by(() => is('switching'));
+
+  // ── Partial text display (live preview during Qwen3-ASR recording) ──
+  let showingPartial: boolean = $derived.by(() => is('recording') && partialText.length > 0);
+  let displayLabelText: string = $derived(showingPartial ? partialText : labelText);
 
   // ── Waveform animation ──
   function animateWaveform() {
@@ -178,16 +194,27 @@
   }
 
   // ── Timer ──
+  function formatElapsed(elapsed: number): string {
+    if (elapsed >= 3600) {
+      const h = Math.floor(elapsed / 3600);
+      const m = Math.floor((elapsed % 3600) / 60);
+      const s = elapsed % 60;
+      return `${h}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+    }
+    const mins = Math.floor(elapsed / 60);
+    const secs = elapsed % 60;
+    return `${mins}:${secs.toString().padStart(2, '0')}`;
+  }
+
   function startTimer() {
     startTime = Date.now();
     timerText = '0:00';
     recProgress = 0;
     timerInterval = setInterval(() => {
       const elapsed = Math.floor((Date.now() - startTime) / 1000);
-      const mins = Math.floor(elapsed / 60);
-      const secs = elapsed % 60;
-      timerText = `${mins}:${secs.toString().padStart(2, '0')}`;
-      recProgress = Math.min(elapsed / maxDuration, 1);
+      timerText = formatElapsed(elapsed);
+      // maxDuration=0 means unlimited — keep progress at 0 to avoid the color gradient shifting
+      recProgress = maxDuration > 0 ? Math.min(elapsed / maxDuration, 1) : 0;
     }, TIMER_INTERVAL);
   }
 
@@ -228,6 +255,7 @@
     stopTimer();
     stopWaveform();
     undoAnimating = false;
+    partialText = '';
   }
 
   function setPreparing() {
@@ -247,6 +275,18 @@
     phase = 'edit_recording';
     startTimer();
     startWaveform();
+  }
+
+  function setMeetingRecording() {
+    clearCommon();
+    phase = 'meeting_recording';
+    startTimer();
+    startWaveform();
+  }
+
+  function setMeetingStopped() {
+    clearCommon();
+    phase = 'meeting_stopped';
   }
 
   function setProcessing() {
@@ -343,6 +383,12 @@
       case 'edit_recording':
         setEditRecording();
         break;
+      case 'meeting_recording':
+        setMeetingRecording();
+        break;
+      case 'meeting_stopped':
+        setMeetingStopped();
+        break;
       case 'processing':
         setProcessing();
         break;
@@ -383,7 +429,7 @@
         ctx.scale(dpr, dpr);
         waveCtx = ctx;
         // Canvas just became available — start animation if we're already recording
-        if ((phase === 'recording' || phase === 'edit_recording') && !waveAnimId) {
+        if ((phase === 'recording' || phase === 'edit_recording' || phase === 'meeting_recording') && !waveAnimId) {
           animateWaveform();
         }
       }
@@ -440,7 +486,12 @@
         setPreparing();
       }
     });
-    unlisteners = [u1, u2, u3, u4];
+    const u5 = await onTranscriptionPartial((payload) => {
+      if (phase === 'recording') {
+        partialText = payload.text;
+      }
+    });
+    unlisteners = [u1, u2, u3, u4, u5];
   });
 
   onDestroy(() => {
@@ -503,7 +554,7 @@
   {/if}
 
   <!-- Label -->
-  <span class="label">{labelText}</span>
+  <span class="label" class:partial-label={showingPartial}>{displayLabelText}</span>
 
   <!-- Timer -->
   {#if showTimer}
@@ -560,6 +611,11 @@
       inset 0 0.5px 0 rgba(255, 255, 255, 0.06);
     color: rgba(255, 255, 255, 0.92);
     animation: fadeIn 0.25s ease-out;
+    transition: width 0.25s ease;
+  }
+
+  .capsule.has-partial {
+    width: 280px;
   }
 
   @keyframes fadeIn {
@@ -736,6 +792,15 @@
     line-height: 1;
   }
 
+  .label.partial-label {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    direction: rtl;
+    text-align: left;
+  }
+
   .timer {
     font-size: 12px;
     font-weight: 500;
@@ -743,6 +808,7 @@
     font-variant-numeric: tabular-nums;
     letter-spacing: 0.02em;
     margin-left: auto;
+    flex-shrink: 0;
     line-height: 1;
   }
 
@@ -770,6 +836,17 @@
           rgba(255, 140, 0, 0.35) calc((1 - var(--rec-progress)) * 100%),
           rgba(255, 59, 48, 0.35)
         ),
+      0 0 0 0.5px rgba(255, 255, 255, 0.08),
+      inset 0 0.5px 0 rgba(255, 255, 255, 0.12);
+  }
+
+  /* ── State: Meeting recording (green) ── */
+  .capsule.meeting-recording {
+    justify-content: flex-start;
+    background: rgba(52, 199, 89, 0.92);
+    border-color: rgba(120, 255, 150, 0.2);
+    box-shadow:
+      0 8px 32px rgba(52, 199, 89, 0.35),
       0 0 0 0.5px rgba(255, 255, 255, 0.08),
       inset 0 0.5px 0 rgba(255, 255, 255, 0.12);
   }

@@ -1,23 +1,28 @@
 mod audio;
+mod audio_devices;
 mod commands;
+mod segment_spacing;
 mod context_detect;
 mod credentials;
 mod history;
 mod hotkey;
+mod meeting_feeder;
+mod meeting_notes;
 mod permissions;
 pub mod platform;
 pub mod models;
 mod polisher;
 mod qwen3_asr;
 pub mod settings;
+mod whisper_streaming;
 pub mod stt;
 mod transcribe;
 pub mod whisper_models;
 
 use std::collections::HashMap;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc, Mutex,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc, Condvar, Mutex,
 };
 use std::time::Instant;
 use tauri::{
@@ -64,6 +69,78 @@ pub struct AppState {
     pub qwen3_asr_ctx: Mutex<Option<qwen3_asr::Qwen3AsrCache>>,
     pub model_switching: AtomicBool,
     pub reconnecting: AtomicBool,
+    pub streaming_active: AtomicBool,
+    pub streaming_cancelled: AtomicBool,
+    pub streaming_result: Mutex<Option<String>>,
+    /// Condvar used to wake feeder threads early when `is_recording` is set to
+    /// false. Replaces a fixed `thread::sleep(2000 ms)` with an interruptible
+    /// `wait_timeout(2000 ms)`, eliminating up to 2 s of unnecessary latency
+    /// for short recordings (especially noticeable on 1–2 s utterances).
+    pub feeder_stop_cv: Condvar,
+    pub feeder_stop_mu: Mutex<()>,
+    pub meeting_active: AtomicBool,
+    pub meeting_cancelled: AtomicBool,
+    /// Guards `stop_meeting_mode` against re-entrant/concurrent invocations.
+    /// Set to `true` at entry, cleared to `false` on exit. Using a dedicated
+    /// flag (instead of `is_recording.swap`) ensures we handle the case where
+    /// `is_recording` was already set to `false` by the dead-stream guard before
+    /// `stop_meeting_mode` is called — without this, the transcript would never
+    /// be delivered.
+    pub meeting_stopping: AtomicBool,
+    /// Monotonically increasing session counter. Incremented each time a new
+    /// meeting session starts. The feeder thread captures this value at launch
+    /// and aborts post-loop work if the counter has advanced, preventing a
+    /// zombie feeder from the previous timed-out session from corrupting the
+    /// new session's transcript or forcing `meeting_active` to false.
+    pub meeting_session: AtomicU64,
+    pub meeting_start_time: Mutex<Option<std::time::Instant>>,
+    pub active_meeting_note_id: Mutex<Option<String>>,
+    /// Monotonically increasing session counter for the normal (non-meeting)
+    /// Qwen3-ASR streaming feeder. Prevents a zombie feeder from a previous
+    /// session from overwriting `streaming_result` for a later recording.
+    pub streaming_session: AtomicU64,
+    /// True while the Whisper live-preview feeder thread is running.
+    pub whisper_preview_active: AtomicBool,
+    /// Monotonically increasing session counter for the Whisper preview feeder.
+    /// Prevents a zombie feeder from a previous recording from emitting stale
+    /// partial results into the current session's overlay.
+    pub whisper_preview_session: AtomicU64,
+    /// Cached `Shortcut` for the edit-by-voice hotkey, set at registration time.
+    /// The handler compares directly against this instead of re-parsing
+    /// `settings.edit_hotkey` on every keypress, eliminating the TOCTOU race
+    /// where settings and the registered shortcut could briefly diverge.
+    pub registered_edit_shortcut: Mutex<Option<Shortcut>>,
+    /// Cached `Shortcut` for the meeting hotkey. Same rationale as above.
+    pub registered_meeting_shortcut: Mutex<Option<Shortcut>>,
+}
+
+/// Emit a `"transcription-partial"` event to the overlay window.
+///
+/// Used by all feeder loops (Qwen3-ASR normal/meeting, Whisper preview/meeting)
+/// to send incremental transcription results to the overlay.
+pub(crate) fn emit_transcription_partial(app: &AppHandle, text: &str) {
+    if let Some(overlay) = app.get_webview_window("overlay") {
+        let _ = overlay.emit(
+            "transcription-partial",
+            serde_json::json!({ "text": text }),
+        );
+    }
+}
+
+/// Position the overlay window centered horizontally, near the bottom of the screen.
+fn center_overlay_bottom(overlay: &tauri::WebviewWindow) {
+    if let Ok(Some(monitor)) = overlay.current_monitor() {
+        let screen = monitor.size();
+        let scale = monitor.scale_factor();
+        let win_w = 300.0;
+        let win_h = 40.0;
+        let x = (screen.width as f64 / scale - win_w) / 2.0;
+        let y = screen.height as f64 / scale - win_h - 80.0;
+        let _ = overlay.set_position(tauri::PhysicalPosition::new(
+            (x * scale) as i32,
+            (y * scale) as i32,
+        ));
+    }
 }
 
 /// Restore original clipboard content from saved_clipboard.
@@ -148,18 +225,11 @@ fn stop_transcribe_and_paste(app: &AppHandle) {
         let dictionary_terms = polish_config.dictionary.enabled_terms();
 
         match audio::do_stop_recording(
-            &state.is_recording,
-            &state.sample_rate,
-            &state.buffer,
-            &state.whisper_ctx,
-            &state.qwen3_asr_ctx,
-            &state.http_client,
+            &state,
             &stt_config,
             &stt_language,
             &stt_app_name,
             &dictionary_terms,
-            &state.vad_ctx,
-            stt_config.vad_enabled,
         ) {
             Ok((text, samples_16k)) => {
                 let transcribe_elapsed = pipeline_start.elapsed();
@@ -451,19 +521,20 @@ fn stop_edit_and_replace(app: &AppHandle) {
             .unwrap_or_default();
         let edit_dict_terms = polish_config.dictionary.enabled_terms();
 
+        // The edit path never spawns a live-preview feeder. Defensively clear
+        // any residual streaming state from a previous normal recording so a
+        // stale result cannot be consumed as the edit instruction.
+        state.streaming_active.store(false, Ordering::SeqCst);
+        if let Ok(mut r) = state.streaming_result.lock() {
+            *r = None;
+        }
+
         match audio::do_stop_recording(
-            &state.is_recording,
-            &state.sample_rate,
-            &state.buffer,
-            &state.whisper_ctx,
-            &state.qwen3_asr_ctx,
-            &state.http_client,
+            &state,
             &stt_config,
             &edit_stt_language,
             &edit_app_name,
             &edit_dict_terms,
-            &state.vad_ctx,
-            stt_config.vad_enabled,
         ) {
             Ok((instruction, _samples)) => {
                 tracing::info!("Edit instruction received: {} graphemes", instruction.graphemes(true).count());
@@ -594,6 +665,83 @@ fn cleanup_old_logs(log_dir: &std::path::Path, keep_days: u64) {
     }
 }
 
+/// Remove model files / directories that are no longer part of the current
+/// model catalogue.  Runs in a background thread at startup so it never
+/// blocks the UI.
+///
+/// Strategy: build an allowlist of every filename / directory name that
+/// any currently-supported model variant can produce, then delete everything
+/// else found inside `models_dir`.
+fn cleanup_obsolete_models(models_dir: &std::path::Path) {
+    use std::collections::HashSet;
+
+    let mut known_files: HashSet<&str> = HashSet::new();
+    let mut known_dirs: HashSet<&str> = HashSet::new();
+
+    // Whisper — all 6 variants (including Medium/Small which are valid but
+    // unmanaged; we still want to keep them if the user downloaded them).
+    for model in &[
+        whisper_models::WhisperModel::LargeV3Turbo,
+        whisper_models::WhisperModel::LargeV3TurboQ5,
+        whisper_models::WhisperModel::Medium,
+        whisper_models::WhisperModel::Small,
+        whisper_models::WhisperModel::Base,
+        whisper_models::WhisperModel::LargeV3TurboZhTw,
+    ] {
+        known_files.insert(model.filename());
+    }
+
+    // Polish models — GGUF + optional tokenizer JSON.
+    for model in polisher::PolishModel::all() {
+        known_files.insert(model.filename());
+        if let Some(tok) = model.tokenizer_filename() {
+            known_files.insert(tok);
+        }
+    }
+
+    // VAD model — derive filename from the canonical path so it stays in sync
+    // automatically when the version is bumped in transcribe::vad_model_path().
+    let vad_filename_owned;
+    if let Some(name) = transcribe::vad_model_path()
+        .file_name()
+        .and_then(|n| n.to_str())
+    {
+        vad_filename_owned = name.to_owned();
+        known_files.insert(&vad_filename_owned);
+    }
+
+    // Qwen3-ASR — stored as subdirectories.
+    for model in &[stt::Qwen3AsrModel::Qwen3Asr1_7B, stt::Qwen3AsrModel::Qwen3Asr0_6B] {
+        known_dirs.insert(model.model_dir_name());
+    }
+
+    let Ok(entries) = std::fs::read_dir(models_dir) else {
+        tracing::warn!("[model-cleanup] Cannot read models dir");
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()).map(str::to_owned) else {
+            continue;
+        };
+
+        if path.is_dir() {
+            if !known_dirs.contains(name.as_str()) {
+                match std::fs::remove_dir_all(&path) {
+                    Ok(()) => tracing::info!("[model-cleanup] Removed obsolete model dir: {name}"),
+                    Err(e) => tracing::warn!("[model-cleanup] Failed to remove dir {name}: {e}"),
+                }
+            }
+        } else if !known_files.contains(name.as_str()) {
+            match std::fs::remove_file(&path) {
+                Ok(()) => tracing::info!("[model-cleanup] Removed obsolete model file: {name}"),
+                Err(e) => tracing::warn!("[model-cleanup] Failed to remove file {name}: {e}"),
+            }
+        }
+    }
+}
+
 // ── App Entry ───────────────────────────────────────────────────────────────
 
 pub fn run() {
@@ -660,6 +808,18 @@ pub fn run() {
             commands::list_qwen3_asr_models,
             commands::switch_qwen3_asr_model,
             commands::download_qwen3_asr_model,
+            commands::delete_whisper_model,
+            commands::delete_polish_model,
+            commands::delete_qwen3_asr_model,
+            commands::delete_vad_model,
+            commands::update_meeting_hotkey,
+            commands::list_meeting_notes,
+            commands::get_meeting_note,
+            commands::rename_meeting_note,
+            commands::delete_meeting_note,
+            commands::delete_all_meeting_notes,
+            commands::get_active_meeting_note_id,
+            commands::polish_meeting_note,
         ])
         .setup(|app| {
             // Initialize logger
@@ -718,8 +878,19 @@ pub fn run() {
             settings::apply_locale_defaults(&mut settings);
             let hotkey_str = settings.hotkey.clone();
 
-            // Migrate legacy JSON history to SQLite
+            // Migrate legacy JSON history to SQLite, then run schema migrations
             history::migrate_from_json(&history_dir(), &audio_dir());
+            history::init_db(&history_dir());
+
+            // Init meeting notes schema & recover notes stuck from a previous crash
+            meeting_notes::init_db(&history_dir());
+            meeting_notes::recover_stuck_notes(&history_dir());
+
+            // Remove obsolete model files in the background (non-blocking).
+            {
+                let dir = models_dir();
+                std::thread::spawn(move || cleanup_obsolete_models(&dir));
+            }
 
             // Pre-initialise audio pipeline
             let is_recording = Arc::new(AtomicBool::new(false));
@@ -764,6 +935,26 @@ pub fn run() {
                 qwen3_asr_ctx: Mutex::new(None),
                 model_switching: AtomicBool::new(false),
                 reconnecting: AtomicBool::new(false),
+                streaming_active: AtomicBool::new(false),
+                streaming_cancelled: AtomicBool::new(false),
+                streaming_result: Mutex::new(None),
+                feeder_stop_cv: Condvar::new(),
+                feeder_stop_mu: Mutex::new(()),
+                meeting_active: AtomicBool::new(false),
+                meeting_cancelled: AtomicBool::new(false),
+                meeting_stopping: AtomicBool::new(false),
+                meeting_session: AtomicU64::new(0),
+                meeting_start_time: Mutex::new(None),
+                active_meeting_note_id: Mutex::new(None),
+                streaming_session: AtomicU64::new(0),
+                whisper_preview_active: AtomicBool::new(false),
+                whisper_preview_session: AtomicU64::new(0),
+                registered_edit_shortcut: Mutex::new(
+                    settings.edit_hotkey.as_deref().and_then(parse_hotkey_string),
+                ),
+                registered_meeting_shortcut: Mutex::new(
+                    settings.meeting_hotkey.as_deref().and_then(parse_hotkey_string),
+                ),
             });
 
             // Register a CoreAudio listener for default-input-device changes.
@@ -772,7 +963,7 @@ pub fn run() {
             // built-in mic (via resolve_input_device), preventing an A2DP → HFP switch.
             {
                 let app_for_listener = app.handle().clone();
-                platform::add_default_input_listener(move || {
+                audio_devices::add_default_input_listener(move || {
                     let state = app_for_listener.state::<AppState>();
 
                     // If the user chose an explicit mic device, never interfere.
@@ -792,7 +983,7 @@ pub fn run() {
                     // our cpal stream is already on the built-in mic — no action needed.
                     // (If the BT stream dies, the error callback will set stream_alive=false
                     //  and do_start_recording will trigger a lazy reconnect.)
-                    if !platform::is_default_input_bluetooth() {
+                    if !crate::audio_devices::is_default_input_bluetooth() {
                         tracing::info!("Default input changed to non-BT device — stream already correct, skipping reconnect");
                         return;
                     }
@@ -982,6 +1173,7 @@ pub fn run() {
                 let primary_shortcut = parse_hotkey_string(&hotkey_str)
                     .unwrap_or(fallback_shortcut);
                 let edit_shortcut = settings.edit_hotkey.as_deref().and_then(parse_hotkey_string);
+                let meeting_shortcut = settings.meeting_hotkey.as_deref().and_then(parse_hotkey_string);
 
                 app.handle().plugin(
                     tauri_plugin_global_shortcut::Builder::new()
@@ -992,10 +1184,16 @@ pub fn run() {
 
                             let state = app.state::<AppState>();
 
-                            let is_edit_hotkey = state.settings.lock()
+                            let is_edit_hotkey = state.registered_edit_shortcut
+                                .lock()
                                 .ok()
-                                .and_then(|s| s.edit_hotkey.as_deref().and_then(parse_hotkey_string))
-                                .is_some_and(|es| *shortcut == es);
+                                .and_then(|g| g.as_ref().map(|s| s == shortcut))
+                                .unwrap_or(false);
+                            let is_meeting_hotkey = state.registered_meeting_shortcut
+                                .lock()
+                                .ok()
+                                .and_then(|g| g.as_ref().map(|s| s == shortcut))
+                                .unwrap_or(false);
 
                             if state.test_mode.load(Ordering::SeqCst) {
                                 if let Some(main_win) = app.get_webview_window("main") {
@@ -1023,6 +1221,22 @@ pub fn run() {
                                 return;
                             }
 
+                            // Meeting hotkey: toggle meeting mode independently.
+                            if is_meeting_hotkey {
+                                if state.meeting_active.load(Ordering::SeqCst) {
+                                    let app_clone = app.clone();
+                                    std::thread::spawn(move || stop_meeting_mode(&app_clone));
+                                } else {
+                                    start_meeting_mode(app);
+                                }
+                                return;
+                            }
+
+                            // Block regular hotkeys while meeting is active.
+                            if state.meeting_active.load(Ordering::SeqCst) {
+                                return;
+                            }
+
                             let is_recording = state.is_recording.load(Ordering::SeqCst);
 
                             if !is_recording {
@@ -1047,20 +1261,7 @@ pub fn run() {
                                         tracing::info!("Edit-by-voice: polish not ready, showing overlay hint");
                                         if let Some(overlay) = app.get_webview_window("overlay") {
                                             let _ = overlay.emit("recording-status", "edit_requires_polish");
-                                            if let Ok(Some(monitor)) = overlay.current_monitor() {
-                                                let screen = monitor.size();
-                                                let scale = monitor.scale_factor();
-                                                let win_w = 300.0;
-                                                let win_h = 40.0;
-                                                let x = (screen.width as f64 / scale - win_w) / 2.0;
-                                                let y = screen.height as f64 / scale - win_h - 80.0;
-                                                let _ = overlay.set_position(
-                                                    tauri::PhysicalPosition::new(
-                                                        (x * scale) as i32,
-                                                        (y * scale) as i32,
-                                                    ),
-                                                );
-                                            }
+                                            center_overlay_bottom(&overlay);
                                             platform::show_overlay(&overlay);
                                         }
                                         hide_overlay_delayed(app, 2000);
@@ -1230,6 +1431,70 @@ pub fn run() {
                                             });
                                         }
 
+                                        // ── Live-preview feeder (Qwen3-ASR non-edit mode only) ──
+                                        // Read all feeder-relevant settings in a single lock acquisition
+                                        // so that no race can occur between computing should_stream and
+                                        // reading feeder_model/feeder_lang.
+                                        let stream_config = if !is_edit_hotkey {
+                                            state.settings.lock().ok().and_then(|s| {
+                                                if s.stt.mode == SttMode::Local
+                                                    && s.stt.local_engine == stt::LocalSttEngine::Qwen3Asr
+                                                {
+                                                    Some((s.stt.qwen3_asr_model.clone(), s.stt.language.clone()))
+                                                } else {
+                                                    None
+                                                }
+                                            })
+                                        } else {
+                                            None
+                                        };
+                                        if let Some((feeder_model, feeder_lang)) = stream_config {
+                                            state.streaming_active.store(true, Ordering::SeqCst);
+                                            // Advance session counter BEFORE resetting streaming_cancelled.
+                                            // This closes a TOCTOU window: any zombie feeder that sees
+                                            // cancelled=false (the reset value) is guaranteed to also see
+                                            // the new session_id (SeqCst total order), so its session guard
+                                            // will reject it before it can write a stale streaming_result.
+                                            let feeder_session_id = state.streaming_session.fetch_add(1, Ordering::SeqCst) + 1;
+                                            state.streaming_cancelled.store(false, Ordering::SeqCst);
+                                            if let Ok(mut r) = state.streaming_result.lock() {
+                                                *r = None;
+                                            }
+                                            let feeder_app = app.clone();
+                                            std::thread::spawn(move || {
+                                                let fstate = feeder_app.state::<AppState>();
+                                                if !qwen3_asr::wait_engine_ready(&fstate.qwen3_asr_ctx, &feeder_model, 8000) {
+                                                    tracing::warn!("[streaming] engine warm-up timed out after 8s — no live preview");
+                                                    fstate.streaming_active.store(false, Ordering::SeqCst);
+                                                    return;
+                                                }
+                                                qwen3_asr::run_feeder_loop(feeder_app, feeder_lang, feeder_session_id);
+                                            });
+                                        }
+
+                                        // ── Live-preview feeder (Whisper non-edit mode only) ──
+                                        let whisper_preview_config = if !is_edit_hotkey {
+                                            state.settings.lock().ok().and_then(|s| {
+                                                if s.stt.mode == SttMode::Local
+                                                    && s.stt.local_engine == stt::LocalSttEngine::Whisper
+                                                {
+                                                    Some(s.stt.language.clone())
+                                                } else {
+                                                    None
+                                                }
+                                            })
+                                        } else {
+                                            None
+                                        };
+                                        if let Some(preview_lang) = whisper_preview_config {
+                                            let preview_session_id = state.whisper_preview_session.fetch_add(1, Ordering::SeqCst) + 1;
+                                            state.whisper_preview_active.store(true, Ordering::SeqCst);
+                                            let preview_app = app.clone();
+                                            std::thread::spawn(move || {
+                                                whisper_streaming::run_whisper_preview_loop(preview_app, preview_lang, preview_session_id);
+                                            });
+                                        }
+
                                         if let Ok(mut ctx) = state.captured_context.lock() {
                                             *ctx = Some(captured_ctx);
                                         }
@@ -1245,109 +1510,12 @@ pub fn run() {
                                             let rec_status = if is_edit_hotkey { "edit_recording" } else { "recording" };
                                             let _ = overlay.emit("recording-status", rec_status);
                                             let _ = overlay.emit("recording-max-duration", MAX_RECORDING_SECS);
-                                            if let Ok(Some(monitor)) = overlay.current_monitor() {
-                                                let screen = monitor.size();
-                                                let scale = monitor.scale_factor();
-                                                let win_w = 300.0;
-                                                let win_h = 40.0;
-                                                let x = (screen.width as f64 / scale - win_w) / 2.0;
-                                                let y = screen.height as f64 / scale - win_h - 80.0;
-                                                let _ = overlay.set_position(
-                                                    tauri::PhysicalPosition::new(
-                                                        (x * scale) as i32,
-                                                        (y * scale) as i32,
-                                                    ),
-                                                );
-                                            }
+                                            center_overlay_bottom(&overlay);
                                             platform::show_overlay(&overlay);
                                         }
 
                                         // Audio level monitoring thread
-                                        let app_for_monitor = app.clone();
-                                        std::thread::spawn(move || {
-                                            let state = app_for_monitor.state::<AppState>();
-                                            let sr = state.sample_rate.lock().ok().and_then(|v| *v).unwrap_or(44100) as usize;
-                                            let recording_start = Instant::now();
-
-                                            const NUM_BARS: usize = 20;
-                                            let samples_per_bar = sr / 20;
-                                            // Adaptive gain: track recent peak RMS so the waveform
-                                            // fills the full visual range regardless of platform
-                                            // mic level (macOS Core Audio vs Windows WASAPI).
-                                            let mut peak_rms: f32 = 0.01; // initial floor
-
-                                            while state.is_recording.load(Ordering::SeqCst) {
-                                                // Dead-stream guard: if buffer is still empty after
-                                                // 1.5 s the cpal callback is not running at all.
-                                                if recording_start.elapsed().as_millis() >= 1500 {
-                                                    let buf_empty = state.buffer.lock()
-                                                        .map(|b| b.is_empty())
-                                                        .unwrap_or(false);
-                                                    if buf_empty {
-                                                        tracing::warn!("⚠️ No audio data after 1.5s — stream dead, aborting recording");
-                                                        state.is_recording.store(false, Ordering::SeqCst);
-                                                        state.mic_available.store(false, Ordering::SeqCst);
-                                                        if let Some(ov) = app_for_monitor.get_webview_window("overlay") {
-                                                            let _ = ov.emit("recording-status", "error");
-                                                        }
-                                                        return;
-                                                    }
-                                                }
-
-                                                if recording_start.elapsed().as_secs() >= MAX_RECORDING_SECS {
-                                                    tracing::info!("⏱️ Max recording duration reached ({}s)", MAX_RECORDING_SECS);
-                                                    if state.edit_mode.load(Ordering::SeqCst) {
-                                                        stop_edit_and_replace(&app_for_monitor);
-                                                    } else {
-                                                        stop_transcribe_and_paste(&app_for_monitor);
-                                                    }
-                                                    return;
-                                                }
-                                                let levels: Vec<f32> = if let Ok(buf) = state.buffer.lock() {
-                                                    if buf.is_empty() {
-                                                        vec![0.0; NUM_BARS]
-                                                    } else {
-                                                        let total = NUM_BARS * samples_per_bar;
-                                                        let start = buf.len().saturating_sub(total);
-                                                        let raw_rms: Vec<f32> = buf[start..]
-                                                            .chunks(samples_per_bar)
-                                                            .map(|chunk| {
-                                                                (chunk.iter().map(|&s| s * s).sum::<f32>()
-                                                                    / chunk.len() as f32)
-                                                                    .sqrt()
-                                                            })
-                                                            .collect();
-                                                        // Fast attack, slow decay (~3.5s to halve at 50ms tick)
-                                                        let frame_max = raw_rms.iter().cloned().fold(0.0f32, f32::max);
-                                                        if frame_max > peak_rms {
-                                                            peak_rms = frame_max;
-                                                        } else {
-                                                            peak_rms *= 0.99;
-                                                        }
-                                                        peak_rms = peak_rms.max(0.001);
-                                                        let mut bars: Vec<f32> = raw_rms.iter()
-                                                            .map(|&rms| (rms / peak_rms).min(1.0))
-                                                            .collect();
-                                                        while bars.len() < NUM_BARS {
-                                                            bars.insert(0, 0.0);
-                                                        }
-                                                        bars
-                                                    }
-                                                } else {
-                                                    vec![0.0; NUM_BARS]
-                                                };
-
-                                                if let Some(ov) = app_for_monitor.get_webview_window("overlay") {
-                                                    let _ = ov.emit("audio-levels", &levels);
-                                                }
-                                                if state.voice_rule_mode.load(Ordering::SeqCst) {
-                                                    if let Some(main_win) = app_for_monitor.get_webview_window("main") {
-                                                        let _ = main_win.emit("voice-rule-levels", &levels);
-                                                    }
-                                                }
-                                                std::thread::sleep(std::time::Duration::from_millis(50));
-                                            }
-                                        });
+                                        spawn_audio_level_monitor(app.clone(), AudioMonitorMode::Normal);
                                     }
                                     Err(e) => {
                                         tracing::error!("Failed to start recording: {}", e);
@@ -1382,6 +1550,13 @@ pub fn run() {
                         tracing::info!("{} edit shortcut registered", hotkey_display_label(edit_hk));
                     }
                 }
+
+                if let Some(meeting_sc) = meeting_shortcut {
+                    app.global_shortcut().register(meeting_sc)?;
+                    if let Some(ref meeting_hk) = settings.meeting_hotkey {
+                        tracing::info!("{} meeting shortcut registered", hotkey_display_label(meeting_hk));
+                    }
+                }
             }
 
             Ok(())
@@ -1397,4 +1572,458 @@ fn show_settings_window(app: &AppHandle) {
         let _ = window.show();
         let _ = window.set_focus();
     }
+}
+
+fn start_meeting_mode(app: &AppHandle) {
+    let state = app.state::<AppState>();
+
+    // Capture frontmost app context before recording starts (same as normal recording).
+    let captured_ctx = state
+        .context_override
+        .lock()
+        .ok()
+        .and_then(|ctx| ctx.clone())
+        .unwrap_or_else(context_detect::detect_frontmost_app);
+    if let Ok(mut ctx) = state.captured_context.lock() {
+        *ctx = Some(captured_ctx);
+    }
+
+    let (stt_mode, local_engine, qwen3_model, whisper_model, lang, cloud_config) = state
+        .settings
+        .lock()
+        .map(|s| (
+            s.stt.mode.clone(),
+            s.stt.local_engine.clone(),
+            s.stt.qwen3_asr_model.clone(),
+            s.stt.whisper_model.clone(),
+            s.stt.language.clone(),
+            s.stt.cloud.clone(),
+        ))
+        .unwrap_or_default();
+
+    // Guard: if a normal recording is already in progress, refuse to start meeting mode
+    // to avoid two feeders sharing the same buffer and is_recording flag.
+    if state.is_recording.load(Ordering::SeqCst) {
+        tracing::warn!("Meeting mode: a normal recording is already in progress, ignoring");
+        return;
+    }
+
+    // Mark meeting_active BEFORE starting recording so the hotkey handler cannot
+    // race: if is_recording becomes true before meeting_active is set, a concurrent
+    // hotkey press would see is_recording=true, meeting_active=false and behave
+    // incorrectly. Reset all flags to a clean state first.
+    state.meeting_active.store(true, Ordering::SeqCst);
+    state.meeting_cancelled.store(false, Ordering::SeqCst);
+    state.meeting_stopping.store(false, Ordering::SeqCst);
+
+    let preferred_device = state.settings.lock().ok().and_then(|s| s.mic_device.clone());
+    if let Err(e) = audio::do_start_recording(
+        &state.is_recording,
+        &state.mic_available,
+        &state.sample_rate,
+        &state.buffer,
+        &state.is_recording,
+        &state.audio_thread,
+        preferred_device,
+    ) {
+        tracing::error!("Meeting mode start failed: {}", e);
+        state.meeting_active.store(false, Ordering::SeqCst);
+        if let Some(overlay) = app.get_webview_window("overlay") {
+            let _ = overlay.emit("recording-status", "error");
+            let app_for_hide = app.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(1500));
+                let app_inner = app_for_hide.clone();
+                let _ = app_for_hide.run_on_main_thread(move || {
+                    if let Some(ov) = app_inner.get_webview_window("overlay") {
+                        platform::hide_overlay(&ov);
+                    }
+                });
+            });
+        }
+        return;
+    }
+    // Advance the session generation counter. The feeder captures this value
+    // and aborts post-loop work if the counter has advanced past it, preventing
+    // a zombie feeder from a timed-out previous session from corrupting state.
+    let session_id = state.meeting_session.fetch_add(1, Ordering::SeqCst) + 1;
+    // Reset normal-recording streaming state in case a previous session left it dirty.
+    state.streaming_active.store(false, Ordering::SeqCst);
+    if let Ok(mut r) = state.streaming_result.lock() {
+        *r = None;
+    }
+    if let Ok(mut st) = state.meeting_start_time.lock() {
+        *st = Some(std::time::Instant::now());
+    }
+
+    // Create a meeting note in SQLite and store the note_id.
+    {
+        let model_label = match stt_mode {
+            SttMode::Cloud => format!("Cloud (Meeting) – {}", cloud_config.provider.as_key()),
+            SttMode::Local => match local_engine {
+                stt::LocalSttEngine::Qwen3Asr => {
+                    format!("Qwen3-ASR (Meeting) – {}", qwen3_model.display_name())
+                }
+                stt::LocalSttEngine::Whisper => {
+                    format!("Whisper (Meeting) – {}", whisper_model.display_name())
+                }
+            },
+        };
+        let note_id = history::generate_id();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        let note = meeting_notes::MeetingNote {
+            id: note_id.clone(),
+            title: String::new(),
+            transcript: String::new(),
+            created_at: now,
+            updated_at: now,
+            duration_secs: 0.0,
+            stt_model: model_label,
+            is_recording: true,
+            word_count: 0,
+            summary: String::new(),
+        };
+        if let Err(e) = meeting_notes::create_note(&settings::history_dir(), &note) {
+            tracing::error!("Failed to create meeting note: {}", e);
+        }
+        if let Ok(mut nid) = state.active_meeting_note_id.lock() {
+            *nid = Some(note_id.clone());
+        }
+        let _ = app.emit("meeting-note-created", serde_json::json!({
+            "id": note_id,
+            "note": note,
+        }));
+    }
+
+    if let Some(overlay) = app.get_webview_window("overlay") {
+        let _ = overlay.emit("recording-status", "meeting_recording");
+        let _ = overlay.emit("recording-max-duration", 0u64); // 0 = unlimited
+        center_overlay_bottom(&overlay);
+        platform::show_overlay(&overlay);
+    }
+
+    // Audio level monitor thread.
+    spawn_audio_level_monitor(app.clone(), AudioMonitorMode::Meeting);
+
+    // Spawn meeting feeder based on STT mode.
+    let feeder_app = app.clone();
+    match stt_mode {
+        SttMode::Local => match local_engine {
+            stt::LocalSttEngine::Qwen3Asr => {
+                std::thread::spawn(move || {
+                    let fstate = feeder_app.state::<AppState>();
+
+                    // Proactively trigger model warm-up (no-op if already loaded).
+                    if let Err(e) = qwen3_asr::warm_qwen3_asr(&fstate.qwen3_asr_ctx, &qwen3_model) {
+                        tracing::warn!("Meeting mode: engine warm failed: {}", e);
+                    }
+
+                    if !qwen3_asr::wait_engine_ready(&fstate.qwen3_asr_ctx, &qwen3_model, 8000) {
+                        tracing::warn!("Meeting mode: engine not ready after 8s, aborting");
+                        fstate.meeting_active.store(false, Ordering::SeqCst);
+                        fstate.is_recording.store(false, Ordering::SeqCst);
+                        // Clear audio captured during the failed warm-up window to prevent
+                        // stale samples from being prepended to the next recording session.
+                        if let Ok(mut buf) = fstate.buffer.lock() {
+                            buf.clear();
+                        }
+                        if let Some(ov) = feeder_app.get_webview_window("overlay") {
+                            let _ = ov.emit("recording-status", "error");
+                        }
+                        hide_overlay_delayed(&feeder_app, 2000);
+                        return;
+                    }
+                    qwen3_asr::run_meeting_feeder_loop(feeder_app, lang, session_id);
+                });
+            }
+            stt::LocalSttEngine::Whisper => {
+                // Check model is downloaded before spawning the feeder thread.
+                if transcribe::whisper_model_path_for(&whisper_model).is_err() {
+                    tracing::warn!("Meeting mode: Whisper model not downloaded");
+                    state.meeting_active.store(false, Ordering::SeqCst);
+                    state.is_recording.store(false, Ordering::SeqCst);
+                    if let Ok(mut buf) = state.buffer.lock() {
+                        buf.clear();
+                    }
+                    if let Some(ov) = app.get_webview_window("overlay") {
+                        let _ = ov.emit("recording-status", "error");
+                    }
+                    hide_overlay_delayed(app, 2000);
+                    return;
+                }
+                std::thread::spawn(move || {
+                    let fstate = feeder_app.state::<AppState>();
+                    // Warm the model (fast for Whisper, typically < 2 s).
+                    if let Err(e) = transcribe::warm_whisper_cache(&fstate.whisper_ctx, &whisper_model) {
+                        tracing::warn!("[whisper-meeting] warm failed: {}", e);
+                        fstate.meeting_active.store(false, Ordering::SeqCst);
+                        fstate.is_recording.store(false, Ordering::SeqCst);
+                        if let Ok(mut buf) = fstate.buffer.lock() {
+                            buf.clear();
+                        }
+                        if let Some(ov) = feeder_app.get_webview_window("overlay") {
+                            let _ = ov.emit("recording-status", "error");
+                        }
+                        hide_overlay_delayed(&feeder_app, 2000);
+                        return;
+                    }
+                    whisper_streaming::run_whisper_meeting_feeder_loop(feeder_app, lang, session_id);
+                });
+            }
+        },
+        SttMode::Cloud => {
+            // Populate API key from cache for the cloud feeder thread.
+            let mut cloud = cloud_config;
+            let key = get_cached_api_key(&state.api_key_cache, cloud.provider.as_key());
+            if !key.is_empty() {
+                cloud.api_key = key;
+            }
+            std::thread::spawn(move || {
+                stt::run_cloud_meeting_feeder_loop(feeder_app, cloud, lang, session_id);
+            });
+        }
+    }
+}
+
+fn stop_meeting_mode(app: &AppHandle) {
+    let state = app.state::<AppState>();
+
+    // Use meeting_stopping as the idempotency gate. is_recording may already be
+    // false if the cpal dead-stream guard fired before this function ran — using
+    // is_recording.swap would silently return without delivering the transcript.
+    if state
+        .meeting_stopping
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return; // Another stop_meeting_mode call is already in progress.
+    }
+
+    // Capture session_id at entry. If a new meeting starts between the timeout
+    // and the clipboard/history section, this guard prevents a zombie stop from
+    // corrupting the new session's state.
+    let our_session = state.meeting_session.load(Ordering::SeqCst);
+
+    // Ensure the feeder sees is_recording=false (it may already be false if
+    // triggered by dead-stream, which is fine — the store is idempotent).
+    state.is_recording.store(false, Ordering::SeqCst);
+    // Wake the meeting feeder immediately so it exits its 2 s sleep and starts
+    // post-loop work (trailing feed + finish_streaming) right away.
+    state.feeder_stop_cv.notify_all();
+
+    if let Some(overlay) = app.get_webview_window("overlay") {
+        let _ = overlay.emit("recording-status", "processing");
+    }
+
+    // Wait for feeder to finish (max 8 s).
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_millis(8000);
+    while state.meeting_active.load(Ordering::SeqCst) {
+        if std::time::Instant::now() >= deadline {
+            tracing::warn!("Meeting feeder timeout — using partial transcript");
+            // Signal the feeder to discard its final result so the zombie
+            // thread cannot overwrite a subsequent session's transcript.
+            state.meeting_cancelled.store(true, Ordering::SeqCst);
+            // Mark inactive immediately so the hotkey is not locked out.
+            state.meeting_active.store(false, Ordering::SeqCst);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    // Abort if a new meeting session has started while we were waiting for the
+    // feeder — another stop_meeting_mode will handle that session's transcript.
+    if state.meeting_session.load(Ordering::SeqCst) != our_session {
+        tracing::warn!("stop_meeting_mode: session advanced during wait — aborting");
+        state.meeting_stopping.store(false, Ordering::SeqCst);
+        return;
+    }
+
+    let duration_secs = state
+        .meeting_start_time
+        .lock()
+        .ok()
+        .and_then(|st| *st)
+        .map(|t| t.elapsed().as_secs_f64())
+        .unwrap_or(0.0);
+
+    // Finalize the meeting note in SQLite (mark is_recording=0).
+    // The transcript is read from the WAL file (the sole source of truth during recording).
+    let note_id = state
+        .active_meeting_note_id
+        .lock()
+        .ok()
+        .and_then(|nid| nid.clone());
+    let hdir = settings::history_dir();
+    let transcript = note_id
+        .as_deref()
+        .map(|id| meeting_notes::read_wal(&hdir, id))
+        .unwrap_or_default();
+    if let Some(ref id) = note_id {
+        if let Err(e) = meeting_notes::finalize_note(&hdir, id, &transcript, duration_secs) {
+            tracing::error!("Failed to finalize meeting note: {}", e);
+        }
+        meeting_notes::remove_wal(&hdir, id);
+        let _ = app.emit(
+            "meeting-note-finalized",
+            serde_json::json!({ "id": id }),
+        );
+    }
+    // Clear the active note id.
+    if let Ok(mut nid) = state.active_meeting_note_id.lock() {
+        *nid = None;
+    }
+
+    if transcript.is_empty() {
+        tracing::info!("Meeting mode stopped — no transcript");
+        if let Some(overlay) = app.get_webview_window("overlay") {
+            let _ = overlay.emit("recording-status", "error");
+        }
+        hide_overlay_delayed(app, 1500);
+        state.meeting_stopping.store(false, Ordering::SeqCst);
+        return;
+    }
+
+    if let Some(overlay) = app.get_webview_window("overlay") {
+        let _ = overlay.emit("recording-status", "meeting_stopped");
+    }
+    hide_overlay_delayed(app, 2000);
+    // meeting_active is already false: either the feeder set it to false when
+    // it finished normally, or stop_meeting_mode set it to false on timeout.
+
+    // Allow future stop_meeting_mode calls (e.g. for the next meeting session).
+    state.meeting_stopping.store(false, Ordering::SeqCst);
+}
+
+// ---------------------------------------------------------------------------
+// Audio level monitor helpers
+// ---------------------------------------------------------------------------
+
+enum AudioMonitorMode {
+    Normal,
+    Meeting,
+}
+
+/// Compute per-bar RMS levels from the current audio buffer, applying adaptive
+/// gain (fast attack, slow decay) so the waveform fills the visual range on
+/// any platform or mic sensitivity.
+///
+/// The buffer lock is held only while copying the tail slice; all computation
+/// runs after the lock is released to minimise contention with the cpal callback.
+fn compute_audio_levels(
+    buffer: &std::sync::Mutex<Vec<f32>>,
+    num_bars: usize,
+    samples_per_bar: usize,
+    peak_rms: &mut f32,
+) -> Vec<f32> {
+    // Copy only the tail we need, then release the lock before computing.
+    let tail: Vec<f32> = {
+        let Ok(buf) = buffer.lock() else {
+            return vec![0.0; num_bars];
+        };
+        if buf.is_empty() {
+            return vec![0.0; num_bars];
+        }
+        let total = num_bars * samples_per_bar;
+        let start = buf.len().saturating_sub(total);
+        buf[start..].to_vec()
+    };
+
+    let raw_rms: Vec<f32> = tail.chunks(samples_per_bar).map(audio::rms).collect();
+
+    // Fast attack, slow decay (~3.5 s to halve at 50 ms tick).
+    let frame_max = raw_rms.iter().cloned().fold(0.0f32, f32::max);
+    if frame_max > *peak_rms {
+        *peak_rms = frame_max;
+    } else {
+        *peak_rms *= 0.99;
+    }
+    *peak_rms = peak_rms.max(0.001);
+
+    // Left-pad with zeros so the waveform always has exactly `num_bars` bars,
+    // with the most-recent audio on the right.
+    let mut bars = vec![0.0f32; num_bars.saturating_sub(raw_rms.len())];
+    bars.extend(raw_rms.iter().map(|&rms| (rms / *peak_rms).min(1.0)));
+    bars
+}
+
+/// Spawn the 50 ms audio-level monitor thread.
+/// `Normal` mode applies max-duration auto-stop and voice-rule-mode forwarding.
+/// `Meeting` mode calls `stop_meeting_mode` on dead-stream detection.
+fn spawn_audio_level_monitor(app: AppHandle, mode: AudioMonitorMode) {
+    std::thread::spawn(move || {
+        let state = app.state::<AppState>();
+        let sr = state.sample_rate.lock().ok().and_then(|v| *v).unwrap_or(44100) as usize;
+        let recording_start = Instant::now();
+
+        const NUM_BARS: usize = 20;
+        let samples_per_bar = sr / 20;
+        // Adaptive gain: track recent peak RMS so the waveform fills the full
+        // visual range regardless of platform mic level.
+        let mut peak_rms: f32 = 0.01;
+        let is_normal = matches!(mode, AudioMonitorMode::Normal);
+
+        while state.is_recording.load(Ordering::SeqCst) {
+            let elapsed = recording_start.elapsed();
+
+            // Dead-stream guard: if the buffer is still empty after 1.5 s the
+            // cpal callback is not running at all.
+            if elapsed.as_millis() >= 1500 {
+                let buf_empty = state.buffer.lock().map(|b| b.is_empty()).unwrap_or(false);
+                if buf_empty {
+                    state.mic_available.store(false, Ordering::SeqCst);
+                    match mode {
+                        AudioMonitorMode::Normal => {
+                            tracing::warn!(
+                                "No audio data after 1.5s — stream dead, aborting recording"
+                            );
+                            state.is_recording.store(false, Ordering::SeqCst);
+                            if let Some(ov) = app.get_webview_window("overlay") {
+                                let _ = ov.emit("recording-status", "error");
+                            }
+                        }
+                        AudioMonitorMode::Meeting => {
+                            tracing::warn!(
+                                "No audio data after 1.5s in meeting mode — stream dead, stopping meeting"
+                            );
+                            // Spawn a new thread: stop_meeting_mode blocks for up
+                            // to 8s waiting for the feeder, which would stall this
+                            // 50ms monitor loop for the entire duration.
+                            let app_clone = app.clone();
+                            std::thread::spawn(move || stop_meeting_mode(&app_clone));
+                        }
+                    }
+                    return;
+                }
+            }
+
+            // Normal mode only: enforce max recording duration.
+            if is_normal && elapsed.as_secs() >= MAX_RECORDING_SECS {
+                tracing::info!("Max recording duration reached ({}s)", MAX_RECORDING_SECS);
+                if state.edit_mode.load(Ordering::SeqCst) {
+                    stop_edit_and_replace(&app);
+                } else {
+                    stop_transcribe_and_paste(&app);
+                }
+                return;
+            }
+
+            let levels = compute_audio_levels(&state.buffer, NUM_BARS, samples_per_bar, &mut peak_rms);
+
+            if let Some(ov) = app.get_webview_window("overlay") {
+                let _ = ov.emit("audio-levels", &levels);
+            }
+            // Normal mode only: forward levels to the main window for voice-rule visualisation.
+            if is_normal && state.voice_rule_mode.load(Ordering::SeqCst) {
+                if let Some(main_win) = app.get_webview_window("main") {
+                    let _ = main_win.emit("voice-rule-levels", &levels);
+                }
+            }
+
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    });
 }

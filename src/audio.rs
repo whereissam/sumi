@@ -5,9 +5,8 @@ use std::sync::{
 };
 use std::time::Instant;
 
-use crate::qwen3_asr::Qwen3AsrCache;
 use crate::stt::{LocalSttEngine, SttConfig, SttMode};
-use crate::transcribe::{transcribe_with_cached_whisper, WhisperContextCache, VadContextCache};
+use crate::transcribe::transcribe_with_cached_whisper;
 
 /// Handle to control (stop) a running audio thread.
 pub struct AudioThreadControl {
@@ -32,31 +31,6 @@ impl AudioThreadControl {
     }
 }
 
-/// Resolve the effective microphone device name, applying Bluetooth avoidance
-/// when the user has not made an explicit device selection.
-///
-/// - `preferred = Some(name)` → user chose a specific device; always honoured.
-/// - `preferred = None` (Auto) → if the system default input is a Bluetooth
-///   device, return the name of the built-in microphone instead. This prevents
-///   macOS from switching the Bluetooth headset from A2DP → HFP (which causes
-///   the microphone to sound dramatically louder and degrades audio output
-///   quality). If no built-in mic exists, falls back to `None` (cpal default).
-pub fn resolve_input_device(preferred: Option<String>) -> Option<String> {
-    if preferred.is_some() {
-        return preferred;
-    }
-    if crate::platform::is_default_input_bluetooth() {
-        let builtin = crate::platform::get_builtin_input_device_name();
-        if builtin.is_none() {
-            tracing::warn!("Default input is Bluetooth but no built-in mic found — recording from BT device");
-        } else {
-            tracing::info!("Default input is Bluetooth — routing to built-in mic: {:?}", builtin);
-        }
-        return builtin; // None = let cpal pick system default (safe fallback)
-    }
-    None
-}
-
 /// Spawn a persistent audio thread that builds and immediately starts the cpal
 /// input stream.  The stream runs for the entire app lifetime — the callback
 /// checks `is_recording` atomically and discards samples when false.
@@ -70,7 +44,7 @@ pub fn spawn_audio_thread(
     device_name: Option<String>,
 ) -> Result<(u32, AudioThreadControl), String> {
     // Apply Bluetooth avoidance when in Auto mode (device_name == None).
-    let device_name = resolve_input_device(device_name);
+    let device_name = crate::audio_devices::resolve_input_device(device_name);
     // Clone the resolved name before it is moved into the spawned thread,
     // so we can record it on AudioThreadControl for the mismatch check.
     let resolved_device_name = device_name.clone();
@@ -102,7 +76,7 @@ pub fn spawn_audio_thread(
                     match host.default_input_device() {
                         Some(d) => d,
                         None => {
-                            let _ = init_tx.send(Err("找不到麥克風裝置".to_string()));
+                            let _ = init_tx.send(Err("No microphone device found".to_string()));
                             return;
                         }
                     }
@@ -112,7 +86,7 @@ pub fn spawn_audio_thread(
             match host.default_input_device() {
                 Some(d) => d,
                 None => {
-                    let _ = init_tx.send(Err("找不到麥克風裝置".to_string()));
+                    let _ = init_tx.send(Err("No microphone device found".to_string()));
                     return;
                 }
             }
@@ -121,7 +95,7 @@ pub fn spawn_audio_thread(
         let config = match device.default_input_config() {
             Ok(c) => c,
             Err(e) => {
-                let _ = init_tx.send(Err(format!("無法取得輸入設定: {}", e)));
+                let _ = init_tx.send(Err(format!("Failed to get input config: {}", e)));
                 return;
             }
         };
@@ -210,7 +184,7 @@ pub fn spawn_audio_thread(
                     )
                 }
                 other => {
-                    let _ = init_tx.send(Err(format!("不支援的音訊格式: {:?}", other)));
+                    let _ = init_tx.send(Err(format!("Unsupported audio format: {:?}", other)));
                     return;
                 }
             }
@@ -219,13 +193,13 @@ pub fn spawn_audio_thread(
         let stream = match stream {
             Ok(s) => s,
             Err(e) => {
-                let _ = init_tx.send(Err(format!("無法建立錄音串流: {}", e)));
+                let _ = init_tx.send(Err(format!("Failed to build input stream: {}", e)));
                 return;
             }
         };
 
         if let Err(e) = stream.play() {
-            let _ = init_tx.send(Err(format!("無法啟動錄音串流: {}", e)));
+            let _ = init_tx.send(Err(format!("Failed to start audio stream: {}", e)));
             return;
         }
 
@@ -250,7 +224,7 @@ pub fn spawn_audio_thread(
 
     let sample_rate = init_rx
         .recv_timeout(std::time::Duration::from_secs(5))
-        .map_err(|_| "音訊執行緒初始化逾時".to_string())??;
+        .map_err(|_| "Audio thread init timed out".to_string())??;
 
     Ok((sample_rate, AudioThreadControl { thread, stop_signal: stop, stream_alive, device_name: resolved_device_name }))
 }
@@ -309,7 +283,7 @@ pub fn do_start_recording(
     // (device_name = None → recorded as None on AudioThreadControl), the
     // wanted device is now Some("MacBook Pro Microphone") — a mismatch.
     // Reconnect *before* setting is_recording so the race window is zero.
-    let wanted = resolve_input_device(device_name.clone());
+    let wanted = crate::audio_devices::resolve_input_device(device_name.clone());
     if wanted.is_some() {
         let current = audio_thread.lock().ok()
             .and_then(|g| g.as_ref().map(|c| c.device_name.clone()))
@@ -330,7 +304,7 @@ pub fn do_start_recording(
 
     // ── Step 3: flip the recording flag ──────────────────────────────────
     if is_recording.load(Ordering::SeqCst) {
-        return Err("已在錄音中".to_string());
+        return Err("Already recording".to_string());
     }
 
     {
@@ -345,38 +319,71 @@ pub fn do_start_recording(
 
 /// Stop recording, transcribe, and return the text + 16 kHz samples for history.
 pub fn do_stop_recording(
-    is_recording: &AtomicBool,
-    sample_rate_mutex: &Mutex<Option<u32>>,
-    buffer: &Arc<Mutex<Vec<f32>>>,
-    whisper_ctx: &Mutex<Option<WhisperContextCache>>,
-    qwen3_asr_ctx: &Mutex<Option<Qwen3AsrCache>>,
-    http_client: &reqwest::blocking::Client,
+    state: &crate::AppState,
     stt_config: &SttConfig,
     language: &str,
     app_name: &str,
     dictionary_terms: &[String],
-    vad_ctx: &Mutex<Option<VadContextCache>>,
-    vad_enabled: bool,
 ) -> Result<(String, Vec<f32>), String> {
-    let sample_rate = sample_rate_mutex
+    let sample_rate = state.sample_rate
         .lock()
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "No microphone available".to_string())?;
 
-    if is_recording
+    if state.is_recording
         .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
     {
-        return Err("目前未在錄音".to_string());
+        return Err("Not currently recording".to_string());
+    }
+    // Wake the streaming feeder immediately so it exits its 2 s sleep and
+    // starts post-loop work (trailing feed + finish_streaming) right away,
+    // reducing transcription latency by up to 2 s on short recordings.
+    state.feeder_stop_cv.notify_all();
+
+    // ── Wait for feeders BEFORE taking the buffer ────────────────────────
+    // The Qwen3-ASR feeder reads trailing audio from the shared buffer in
+    // its post-loop code. If we `take` the buffer first, the feeder sees
+    // an empty buffer and the last 0–2 s of audio is silently dropped.
+    // Waiting here ensures the feeder finishes its trailing feed before we
+    // drain the buffer for the batch fallback / history audio.
+    let mut qwen3_streaming_result: Option<String> = None;
+    if stt_config.mode == SttMode::Local && stt_config.local_engine == LocalSttEngine::Qwen3Asr
+        && state.streaming_active.load(Ordering::SeqCst)
+    {
+        let deadline = Instant::now() + std::time::Duration::from_millis(3000);
+        while state.streaming_active.load(Ordering::SeqCst) {
+            if Instant::now() >= deadline {
+                tracing::warn!("[streaming] feeder timeout — signalling cancel, falling back to batch");
+                state.streaming_cancelled.store(true, Ordering::SeqCst);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        // Grab the streaming result now (feeder stored it before clearing streaming_active).
+        if let Ok(mut guard) = state.streaming_result.lock() {
+            qwen3_streaming_result = guard.take();
+        }
+    }
+    if stt_config.mode == SttMode::Local && stt_config.local_engine == LocalSttEngine::Whisper
+        && state.whisper_preview_active.load(Ordering::SeqCst)
+    {
+        let deadline = Instant::now() + std::time::Duration::from_millis(2000);
+        while state.whisper_preview_active.load(Ordering::SeqCst) && Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        if state.whisper_preview_active.load(Ordering::SeqCst) {
+            tracing::warn!("[whisper-preview] feeder still active after 2s wait — proceeding anyway");
+        }
     }
 
     let samples: Vec<f32> = {
-        let mut buf = buffer.lock().map_err(|e| e.to_string())?;
+        let mut buf = state.buffer.lock().map_err(|e| e.to_string())?;
         std::mem::take(&mut *buf)
     };
 
     if samples.is_empty() {
-        return Err("沒有錄到任何聲音".to_string());
+        return Err("No audio captured".to_string());
     }
 
     tracing::info!(
@@ -396,10 +403,11 @@ pub fn do_stop_recording(
     };
 
     // ── VAD or RMS trimming ─────────────────────────────────────────────
+    let vad_enabled = stt_config.vad_enabled;
     let vad_model_exists = crate::transcribe::vad_model_path().exists();
     if vad_enabled && vad_model_exists {
         // Use Silero VAD to extract speech segments
-        match crate::transcribe::filter_with_vad(vad_ctx, &samples_16k) {
+        match crate::transcribe::filter_with_vad(&state.vad_ctx, &samples_16k) {
             Ok(speech) if speech.is_empty() => {
                 tracing::info!("VAD: no speech segments found");
                 return Err("no_speech".to_string());
@@ -428,23 +436,38 @@ pub fn do_stop_recording(
     let text = match stt_config.mode {
         SttMode::Local => match stt_config.local_engine {
             LocalSttEngine::Whisper => {
-                let result = transcribe_with_cached_whisper(whisper_ctx, &samples_16k, &stt_config.whisper_model, language, app_name, dictionary_terms)?;
+                let result = transcribe_with_cached_whisper(&state.whisper_ctx, &samples_16k, &stt_config.whisper_model, language, app_name, dictionary_terms)?;
                 tracing::info!("[timing] STT (local whisper): {:.0?}", stt_start.elapsed());
                 result
             }
             LocalSttEngine::Qwen3Asr => {
+                // Use the streaming result if the feeder finished in time.
+                if let Some(text) = qwen3_streaming_result {
+                    tracing::info!("[timing] STT (local qwen3-asr streaming): {:.0?}", stt_start.elapsed());
+                    return if text.is_empty() {
+                        Err("no_speech".to_string())
+                    } else {
+                        Ok((text, samples_16k))
+                    };
+                }
+
+                // Batch fallback. The feeder has been signalled to cancel so it
+                // will skip post-loop engine work once it wakes. It may still
+                // be holding qwen3_asr_ctx mid-inference; this call will block
+                // briefly until the feeder releases the lock.
+                tracing::info!("[streaming] using batch fallback");
                 let result = crate::qwen3_asr::transcribe_with_cached_qwen3_asr(
-                    qwen3_asr_ctx,
+                    &state.qwen3_asr_ctx,
                     &samples_16k,
                     &stt_config.qwen3_asr_model,
                     language,
                 )?;
-                tracing::info!("[timing] STT (local qwen3-asr): {:.0?}", stt_start.elapsed());
+                tracing::info!("[timing] STT (local qwen3-asr batch): {:.0?}", stt_start.elapsed());
                 result
             }
         },
         SttMode::Cloud => {
-            let result = crate::stt::run_cloud_stt(&stt_config.cloud, &samples_16k, http_client)?;
+            let result = crate::stt::run_cloud_stt(&stt_config.cloud, &samples_16k, &state.http_client, None)?;
             tracing::info!("[timing] STT (cloud {}): {:.0?}", stt_config.cloud.provider.as_key(), stt_start.elapsed());
             result
         }
@@ -459,7 +482,7 @@ pub fn do_stop_recording(
 
 /// RMS (root mean square) energy of an audio slice.
 #[inline]
-fn rms(samples: &[f32]) -> f32 {
+pub(crate) fn rms(samples: &[f32]) -> f32 {
     (samples.iter().map(|&s| s * s).sum::<f32>() / samples.len() as f32).sqrt()
 }
 

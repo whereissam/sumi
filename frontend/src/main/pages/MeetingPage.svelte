@@ -1,0 +1,1061 @@
+<script lang="ts">
+  import { onMount, onDestroy, tick } from 'svelte';
+  import { marked } from 'marked';
+  import { t } from '$lib/stores/i18n.svelte';
+  import { showConfirm } from '$lib/stores/ui.svelte';
+  import {
+    listMeetingNotes,
+    getActiveMeetingNoteId,
+    getMeetingNote,
+    renameMeetingNote,
+    deleteMeetingNote,
+    polishMeetingNote,
+    onMeetingNoteCreated,
+    onMeetingNoteUpdated,
+    onMeetingNoteFinalized,
+  } from '$lib/api';
+  import type { MeetingNote } from '$lib/types';
+  import type { UnlistenFn } from '@tauri-apps/api/event';
+
+  let notes = $state<MeetingNote[]>([]);
+  let selectedId = $state<string | null>(null);
+  let loading = $state(true);
+
+  // Inline rename
+  let editingTitleId = $state<string | null>(null);
+  let editingTitleValue = $state('');
+  let titleInputEl = $state<HTMLInputElement | undefined>();
+
+  // Auto-scroll
+  let transcriptEl = $state<HTMLDivElement | undefined>();
+  let userScrolledUp = $state(false);
+
+  // Polish / tab state
+  let polishing = $state(false);
+  let activeTab = $state<'transcript' | 'summary'>('transcript');
+
+  // Copy feedback
+  let copied = $state(false);
+  let copiedTimeout: ReturnType<typeof setTimeout> | null = null;
+
+  // Split copy dropdown
+  let copyMenuOpen = $state(false);
+
+  // Context menu
+  let contextMenuId = $state<string | null>(null);
+  let contextMenuX = $state(0);
+  let contextMenuY = $state(0);
+
+  let unlisteners: UnlistenFn[] = [];
+
+  let selectedNote = $derived(notes.find((n) => n.id === selectedId) ?? null);
+
+  function renderMarkdown(md: string): string {
+    return marked.parse(md, { async: false }) as string;
+  }
+
+  // Auto-set active tab when note changes
+  $effect(() => {
+    if (selectedNote) {
+      activeTab = selectedNote.summary ? 'summary' : 'transcript';
+    }
+  });
+
+  function formatDate(ts: number): string {
+    const d = new Date(ts);
+    return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
+  }
+
+  function formatTime(ts: number): string {
+    const d = new Date(ts);
+    return d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+  }
+
+  function formatDuration(secs: number): string {
+    if (secs < 60) return `${Math.round(secs)}s`;
+    const m = Math.floor(secs / 60);
+    const s = Math.round(secs % 60);
+    if (m < 60) return `${m}m ${s}s`;
+    const h = Math.floor(m / 60);
+    const rm = m % 60;
+    return `${h}h ${rm}m`;
+  }
+
+  function preview(text: string, maxLen = 80): string {
+    if (!text) return '';
+    const oneLine = text.replace(/\n/g, ' ');
+    return oneLine.length > maxLen ? oneLine.slice(0, maxLen) + '…' : oneLine;
+  }
+
+  function defaultTitle(note: MeetingNote): string {
+    if (note.title) return note.title;
+    const d = new Date(note.created_at);
+    const mm = String(d.getMonth() + 1).padStart(2, '0');
+    const dd = String(d.getDate()).padStart(2, '0');
+    const hh = String(d.getHours()).padStart(2, '0');
+    const mi = String(d.getMinutes()).padStart(2, '0');
+    return `Meeting ${mm}-${dd} ${hh}:${mi}`;
+  }
+
+  // ── Auto-scroll logic ──
+  function handleTranscriptScroll() {
+    if (!transcriptEl) return;
+    const { scrollTop, scrollHeight, clientHeight } = transcriptEl;
+    userScrolledUp = scrollHeight - scrollTop - clientHeight > 50;
+  }
+
+  async function autoScroll() {
+    if (!userScrolledUp && transcriptEl) {
+      await tick();
+      transcriptEl.scrollTop = transcriptEl.scrollHeight;
+    }
+  }
+
+  // ── Rename ──
+  function startRename(note: MeetingNote) {
+    editingTitleId = note.id;
+    editingTitleValue = defaultTitle(note);
+    contextMenuId = null;
+    tick().then(() => {
+      titleInputEl?.select();
+    });
+  }
+
+  async function commitRename() {
+    if (!editingTitleId) return;
+    const trimmed = editingTitleValue.trim();
+    if (trimmed) {
+      try {
+        await renameMeetingNote(editingTitleId, trimmed);
+        const n = notes.find((x) => x.id === editingTitleId);
+        if (n) n.title = trimmed;
+      } catch (e) {
+        console.error('Rename failed:', e);
+      }
+    }
+    editingTitleId = null;
+  }
+
+  function handleTitleKeydown(e: KeyboardEvent) {
+    if (e.key === 'Enter') commitRename();
+    if (e.key === 'Escape') {
+      editingTitleId = null;
+    }
+  }
+
+  // ── Delete ──
+  async function handleDelete(id: string) {
+    contextMenuId = null;
+    showConfirm(
+      t('meeting.delete'),
+      t('meeting.deleteConfirm'),
+      t('meeting.delete'),
+      async () => {
+        try {
+          await deleteMeetingNote(id);
+          notes = notes.filter((n) => n.id !== id);
+          if (selectedId === id) {
+            selectedId = notes.length > 0 ? notes[0].id : null;
+          }
+        } catch (e) {
+          console.error('Delete failed:', e);
+        }
+      },
+    );
+  }
+
+
+  // ── Copy ──
+  function stripMarkdown(md: string): string {
+    return md
+      .replace(/^#{1,6}\s+/gm, '')  // headings
+      .replace(/\*\*(.+?)\*\*/g, '$1')  // bold
+      .replace(/\*(.+?)\*/g, '$1')  // italic
+      .replace(/`(.+?)`/g, '$1')  // inline code
+      .replace(/^\s*[-*]\s+/gm, '- ')  // normalize bullets
+      .replace(/\n{3,}/g, '\n\n')  // collapse blank lines
+      .trim();
+  }
+
+  async function copyText(text: string) {
+    try {
+      await navigator.clipboard.writeText(text);
+      copied = true;
+      copyMenuOpen = false;
+      if (copiedTimeout) clearTimeout(copiedTimeout);
+      copiedTimeout = setTimeout(() => (copied = false), 1500);
+    } catch (e) {
+      console.error('Copy failed:', e);
+    }
+  }
+
+  async function handleCopy() {
+    if (!selectedNote) return;
+    if (activeTab === 'summary' && selectedNote.summary) {
+      await copyText(stripMarkdown(selectedNote.summary));
+    } else {
+      await copyText(selectedNote.transcript);
+    }
+  }
+
+  async function handleCopyMarkdown() {
+    if (!selectedNote?.summary) return;
+    await copyText(selectedNote.summary);
+  }
+
+  function toggleCopyMenu(e: MouseEvent) {
+    e.stopPropagation();
+    copyMenuOpen = !copyMenuOpen;
+  }
+
+  // ── Polish ──
+  async function handlePolish() {
+    if (!selectedNote || polishing) return;
+    const noteId = selectedNote.id;
+    polishing = true;
+    try {
+      const result = await polishMeetingNote(noteId);
+      // Only apply if user hasn't switched to a different note
+      const n = notes.find((x) => x.id === noteId);
+      if (n) {
+        n.title = result.title;
+        n.summary = result.summary;
+        notes = [...notes];
+      }
+      if (selectedId === noteId) {
+        activeTab = 'summary';
+      }
+    } catch (e: any) {
+      console.error('Polish failed:', e);
+      const msg = typeof e === 'string' ? e : e?.message ?? t('meeting.polishError');
+      // Brief inline feedback — could be a toast in the future
+      alert(msg);
+    }
+    polishing = false;
+  }
+
+  // ── Context menu ──
+  function handleContextMenu(e: MouseEvent, id: string) {
+    e.preventDefault();
+    contextMenuId = id;
+    contextMenuX = e.clientX;
+    contextMenuY = e.clientY;
+  }
+
+  function closeContextMenu() {
+    contextMenuId = null;
+    copyMenuOpen = false;
+  }
+
+  // ── Lifecycle ──
+  onMount(async () => {
+    loading = true;
+    try {
+      notes = await listMeetingNotes();
+      const activeId = await getActiveMeetingNoteId();
+      if (activeId) {
+        selectedId = activeId;
+      } else if (notes.length > 0) {
+        selectedId = notes[0].id;
+      }
+    } catch (e) {
+      console.error('Failed to load meeting notes:', e);
+    }
+    loading = false;
+
+    const u1 = await onMeetingNoteCreated((p) => {
+      // Add to top of list and select it.
+      notes = [p.note, ...notes];
+      selectedId = p.id;
+      userScrolledUp = false;
+    });
+
+    const u2 = await onMeetingNoteUpdated((p) => {
+      const n = notes.find((x) => x.id === p.id);
+      if (n) {
+        // Accumulate delta — the backend sends only finalized segment text.
+        n.transcript += p.delta;
+        n.duration_secs = p.duration_secs;
+        notes = [...notes];
+      }
+      if (selectedId === p.id) {
+        autoScroll();
+      }
+    });
+
+    const u3 = await onMeetingNoteFinalized(async (p) => {
+      try {
+        // Re-fetch from SQLite to get the authoritative transcript
+        // (includes post-loop flush text that may not have been emitted as a delta).
+        const fresh = await getMeetingNote(p.id);
+        const idx = notes.findIndex((x) => x.id === p.id);
+        if (idx !== -1) {
+          notes[idx] = fresh;
+          notes = [...notes];
+        }
+      } catch {
+        // Fallback: just flip the flag
+        const n = notes.find((x) => x.id === p.id);
+        if (n) {
+          n.is_recording = false;
+          notes = [...notes];
+        }
+      }
+    });
+
+    unlisteners = [u1, u2, u3];
+
+    // Close context menu on outside click
+    document.addEventListener('click', closeContextMenu);
+  });
+
+  onDestroy(() => {
+    for (const unlisten of unlisteners) {
+      unlisten();
+    }
+    document.removeEventListener('click', closeContextMenu);
+    if (copiedTimeout) clearTimeout(copiedTimeout);
+  });
+</script>
+
+<div class="meeting-page">
+  <!-- Left panel: note list -->
+  <div class="note-list-panel">
+    <div class="list-header">
+      <h2>{t('nav.meeting')}</h2>
+    </div>
+
+    <div class="note-list">
+      {#if loading}
+        <div class="list-empty">
+          <span class="spinner-small"></span>
+        </div>
+      {:else if notes.length === 0}
+        <div class="list-empty">
+          <p class="empty-title">{t('meeting.emptyTitle')}</p>
+          <p class="empty-hint">{t('meeting.emptyHint')}</p>
+        </div>
+      {:else}
+        {#each notes as note (note.id)}
+          <!-- svelte-ignore a11y_no_static_element_interactions -->
+          <div
+            class="note-item-wrapper"
+            class:active={selectedId === note.id}
+          >
+            <button
+              class="note-item"
+              class:active={selectedId === note.id}
+              onclick={() => {
+                selectedId = note.id;
+                userScrolledUp = false;
+              }}
+              oncontextmenu={(e) => handleContextMenu(e, note.id)}
+            >
+              <div class="note-item-top">
+                {#if note.is_recording}
+                  <span class="recording-dot"></span>
+                {/if}
+                <span class="note-title">{defaultTitle(note)}</span>
+              </div>
+              <div class="note-item-meta">
+                <span>{formatDate(note.created_at)}</span>
+                <span class="meta-sep">·</span>
+                <span>{formatDuration(note.duration_secs)}</span>
+              </div>
+              <div class="note-item-preview">{preview(note.transcript)}</div>
+            </button>
+            {#if !note.is_recording}
+              <button
+                class="note-delete-btn"
+                onclick={(e) => { e.stopPropagation(); handleDelete(note.id); }}
+                title={t('meeting.delete')}
+              >
+                <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+              </button>
+            {/if}
+          </div>
+        {/each}
+      {/if}
+    </div>
+  </div>
+
+  <!-- Right panel: note content -->
+  <div class="note-content-panel">
+    {#if selectedNote}
+      <div class="content-header">
+        {#if editingTitleId === selectedNote.id}
+          <input
+            class="title-input"
+            bind:this={titleInputEl}
+            bind:value={editingTitleValue}
+            onblur={commitRename}
+            onkeydown={handleTitleKeydown}
+          />
+        {:else}
+          <h1 class="content-title" ondblclick={() => startRename(selectedNote!)}>
+            {defaultTitle(selectedNote)}
+            <button class="rename-btn" onclick={() => startRename(selectedNote!)} title={t('meeting.rename')}>
+              <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+            </button>
+            <button
+              class="polish-btn"
+              onclick={handlePolish}
+              disabled={polishing || selectedNote!.is_recording || !selectedNote!.transcript}
+              title={t(polishing ? 'meeting.polishing' : 'meeting.polish')}
+            >
+              {#if polishing}
+                <span class="spinner-inline"></span>
+              {:else}
+                <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m12 3-1.912 5.813a2 2 0 0 1-1.275 1.275L3 12l5.813 1.912a2 2 0 0 1 1.275 1.275L12 21l1.912-5.813a2 2 0 0 1 1.275-1.275L21 12l-5.813-1.912a2 2 0 0 1-1.275-1.275L12 3Z"/><path d="M5 3v4"/><path d="M19 17v4"/><path d="M3 5h4"/><path d="M17 19h4"/></svg>
+              {/if}
+            </button>
+          </h1>
+        {/if}
+      </div>
+
+      <div class="content-divider"></div>
+
+      {#if selectedNote.summary || polishing}
+        <div class="tab-bar">
+          <button
+            class="tab-btn"
+            class:active={activeTab === 'transcript'}
+            onclick={() => (activeTab = 'transcript')}
+          >
+            {t('meeting.tabTranscript')}
+          </button>
+          <button
+            class="tab-btn"
+            class:active={activeTab === 'summary'}
+            onclick={() => (activeTab = 'summary')}
+          >
+            {t('meeting.tabSummary')}
+          </button>
+        </div>
+      {/if}
+
+      <div
+        class="transcript-area"
+        bind:this={transcriptEl}
+        onscroll={handleTranscriptScroll}
+      >
+        {#if activeTab === 'summary'}
+          {#if selectedNote.summary}
+            <div class="summary-text markdown-body">{@html renderMarkdown(selectedNote.summary)}</div>
+          {:else}
+            <p class="no-content">{t('meeting.noSummaryYet')}</p>
+          {/if}
+        {:else if selectedNote.transcript}
+          <pre class="transcript-text">{selectedNote.transcript}</pre>
+        {:else}
+          <p class="no-content">{t('meeting.noContent')}</p>
+        {/if}
+      </div>
+
+      <div class="content-footer">
+        <div class="footer-meta">
+          {#if selectedNote.is_recording}
+            <span class="meta-recording">
+              <span class="recording-dot-small"></span>
+              {t('meeting.recording')}
+            </span>
+          {/if}
+          <span>{formatDuration(selectedNote.duration_secs)}</span>
+          <span class="meta-sep">·</span>
+          <span>{selectedNote.word_count} {t('meeting.words')}</span>
+          <span class="meta-sep">·</span>
+          <span>{selectedNote.stt_model}</span>
+          <span class="meta-sep">·</span>
+          <span>{formatDate(selectedNote.created_at)} {formatTime(selectedNote.created_at)}</span>
+        </div>
+        <div class="copy-btn-group">
+          <button
+            class="copy-btn"
+            onclick={handleCopy}
+            disabled={activeTab === 'summary' ? !selectedNote.summary : !selectedNote.transcript}
+          >
+            {#if copied}
+              <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+              {t('meeting.copied')}
+            {:else}
+              <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+              {activeTab === 'summary' ? t('meeting.copy') : t('meeting.copyTranscript')}
+            {/if}
+          </button>
+          {#if activeTab === 'summary' && selectedNote.summary}
+            <button
+              class="copy-chevron-btn"
+              onclick={toggleCopyMenu}
+              disabled={!selectedNote.summary}
+            >
+              <svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
+            </button>
+            {#if copyMenuOpen}
+              <!-- svelte-ignore a11y_click_events_have_key_events -->
+              <!-- svelte-ignore a11y_no_static_element_interactions -->
+              <div class="copy-dropdown" onclick={(e: MouseEvent) => e.stopPropagation()}>
+                <button onclick={handleCopyMarkdown}>
+                  {t('meeting.copyAsMarkdown')}
+                </button>
+              </div>
+            {/if}
+          {/if}
+        </div>
+      </div>
+    {:else if !loading}
+      <div class="content-empty">
+        <p class="empty-title">{t('meeting.emptyTitle')}</p>
+        <p class="empty-hint">{t('meeting.emptyHint')}</p>
+      </div>
+    {/if}
+  </div>
+
+  <!-- Context menu -->
+  {#if contextMenuId}
+    <!-- svelte-ignore a11y_no_static_element_interactions -->
+    <!-- svelte-ignore a11y_click_events_have_key_events -->
+    <div class="context-menu" style="left:{contextMenuX}px;top:{contextMenuY}px">
+      <button onclick={() => { const n = notes.find(x => x.id === contextMenuId); if (n) startRename(n); }}>
+        {t('meeting.rename')}
+      </button>
+      <button class="danger" onclick={() => { if (contextMenuId) handleDelete(contextMenuId); }}>
+        {t('meeting.delete')}
+      </button>
+    </div>
+  {/if}
+</div>
+
+<style>
+  .meeting-page {
+    display: flex;
+    height: 100%;
+    min-height: 0;
+  }
+
+  /* ── Left panel ── */
+  .note-list-panel {
+    width: 260px;
+    min-width: 260px;
+    border-right: 1px solid var(--border-divider);
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+  }
+
+  .list-header {
+    padding: 16px 16px 12px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-shrink: 0;
+  }
+
+  .list-header h2 {
+    font-size: 16px;
+    font-weight: 700;
+    color: var(--text-primary);
+    margin: 0;
+  }
+
+  .note-list {
+    flex: 1;
+    overflow-y: auto;
+    padding: 0 8px 8px;
+  }
+
+  .list-empty {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 40px 20px;
+    text-align: center;
+  }
+
+  .empty-title {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    margin: 0 0 4px;
+  }
+
+  .empty-hint {
+    font-size: 12px;
+    color: var(--text-tertiary);
+    margin: 0;
+  }
+
+  .note-item-wrapper {
+    position: relative;
+    border-radius: var(--radius-md, 8px);
+    transition: background 0.15s;
+  }
+  .note-item-wrapper:hover {
+    background: var(--bg-hover);
+  }
+  .note-item-wrapper.active {
+    background: var(--bg-active);
+  }
+
+  .note-item-wrapper:hover .note-delete-btn {
+    opacity: 1;
+  }
+
+  .note-item {
+    width: 100%;
+    text-align: left;
+    background: none;
+    border: none;
+    padding: 10px 12px;
+    border-radius: var(--radius-md, 8px);
+    cursor: pointer;
+    font-family: inherit;
+  }
+
+  .note-delete-btn {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    background: none;
+    border: none;
+    color: var(--text-tertiary);
+    cursor: pointer;
+    padding: 4px;
+    border-radius: 4px;
+    display: flex;
+    align-items: center;
+    opacity: 0;
+    transition: opacity 0.15s, color 0.15s;
+  }
+  .note-delete-btn:hover {
+    color: #ff3b30;
+    background: var(--bg-hover);
+  }
+
+  .note-item-top {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .note-title {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-primary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .recording-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #34c759;
+    flex-shrink: 0;
+    animation: dotPulse 1.8s ease-in-out infinite;
+  }
+
+  @keyframes dotPulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.4; }
+  }
+
+  .note-item-meta {
+    font-size: 11px;
+    color: var(--text-tertiary);
+    margin-top: 2px;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+
+  .meta-sep {
+    opacity: 0.5;
+  }
+
+  .note-item-preview {
+    font-size: 12px;
+    color: var(--text-secondary);
+    margin-top: 4px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  /* ── Right panel ── */
+  .note-content-panel {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    height: 100%;
+  }
+
+  .content-header {
+    padding: 16px 24px 8px;
+    flex-shrink: 0;
+  }
+
+  .content-title {
+    font-size: 20px;
+    font-weight: 700;
+    color: var(--text-primary);
+    margin: 0;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .rename-btn {
+    background: none;
+    border: none;
+    color: var(--text-tertiary);
+    cursor: pointer;
+    padding: 4px;
+    border-radius: 4px;
+    display: flex;
+    opacity: 0;
+    transition: opacity 0.15s;
+  }
+  .content-title:hover .rename-btn {
+    opacity: 1;
+  }
+  .rename-btn:hover {
+    color: var(--text-primary);
+    background: var(--bg-hover);
+  }
+
+  .title-input {
+    font-size: 20px;
+    font-weight: 700;
+    color: var(--text-primary);
+    background: none;
+    border: none;
+    border-bottom: 2px solid var(--accent-primary, #007aff);
+    outline: none;
+    width: 100%;
+    padding: 0 0 2px;
+    font-family: inherit;
+  }
+
+  .content-divider {
+    height: 1px;
+    background: var(--border-divider);
+    margin: 0 24px;
+    flex-shrink: 0;
+  }
+
+  .transcript-area {
+    flex: 1;
+    overflow-y: auto;
+    padding: 16px 24px;
+    min-height: 0;
+  }
+
+  .transcript-text {
+    font-size: 14px;
+    line-height: 1.7;
+    color: var(--text-primary);
+    white-space: pre-wrap;
+    word-break: break-word;
+    margin: 0;
+    font-family: inherit;
+  }
+
+  .no-content {
+    font-size: 14px;
+    color: var(--text-tertiary);
+    font-style: italic;
+    margin: 0;
+  }
+
+  .content-footer {
+    flex-shrink: 0;
+    padding: 12px 24px;
+    border-top: 1px solid var(--border-divider);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+  }
+
+  .footer-meta {
+    font-size: 11px;
+    color: var(--text-tertiary);
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex-wrap: wrap;
+    min-width: 0;
+  }
+
+  .meta-recording {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    color: #34c759;
+    font-weight: 600;
+  }
+
+  .recording-dot-small {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: #34c759;
+    animation: dotPulse 1.8s ease-in-out infinite;
+  }
+
+  .copy-btn-group {
+    position: relative;
+    display: flex;
+    align-items: center;
+    flex-shrink: 0;
+  }
+
+  .copy-btn {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 12px;
+    border-radius: 6px;
+    border: 1px solid var(--border-subtle);
+    background: var(--bg-hover);
+    color: var(--text-secondary);
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+    font-family: inherit;
+    transition: all 0.15s;
+    flex-shrink: 0;
+  }
+  .copy-btn-group .copy-btn {
+    border-top-right-radius: 0;
+    border-bottom-right-radius: 0;
+    border-right: none;
+  }
+  .copy-btn-group .copy-btn:only-child {
+    border-radius: 6px;
+    border-right: 1px solid var(--border-subtle);
+  }
+  .copy-btn:hover:not(:disabled) {
+    background: var(--bg-active);
+    color: var(--text-primary);
+  }
+  .copy-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+
+  .copy-chevron-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 6px 6px;
+    border-radius: 0 6px 6px 0;
+    border: 1px solid var(--border-subtle);
+    border-left: 1px solid var(--border-divider);
+    background: var(--bg-hover);
+    color: var(--text-secondary);
+    cursor: pointer;
+    transition: all 0.15s;
+    align-self: stretch;
+  }
+  .copy-chevron-btn:hover:not(:disabled) {
+    background: var(--bg-active);
+    color: var(--text-primary);
+  }
+  .copy-chevron-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+
+  .copy-dropdown {
+    position: absolute;
+    bottom: 100%;
+    right: 0;
+    margin-bottom: 4px;
+    background: var(--bg-sidebar, #1c1c20);
+    border: 1px solid var(--border-subtle);
+    border-radius: 8px;
+    padding: 4px;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+    z-index: 100;
+    min-width: 160px;
+  }
+  .copy-dropdown button {
+    width: 100%;
+    text-align: left;
+    background: none;
+    border: none;
+    padding: 8px 12px;
+    border-radius: 6px;
+    font-size: 13px;
+    color: var(--text-primary);
+    cursor: pointer;
+    font-family: inherit;
+    white-space: nowrap;
+  }
+  .copy-dropdown button:hover {
+    background: var(--bg-hover);
+  }
+
+  .polish-btn {
+    background: none;
+    border: none;
+    color: var(--text-tertiary);
+    cursor: pointer;
+    padding: 4px;
+    border-radius: 4px;
+    display: flex;
+    opacity: 0;
+    transition: opacity 0.15s, color 0.15s;
+  }
+  .content-title:hover .polish-btn {
+    opacity: 1;
+  }
+  .polish-btn:hover:not(:disabled) {
+    color: #f5a623;
+    background: var(--bg-hover);
+  }
+  .polish-btn:disabled {
+    opacity: 0.3;
+    cursor: not-allowed;
+  }
+
+  .spinner-inline {
+    width: 14px;
+    height: 14px;
+    border: 2px solid var(--border-subtle);
+    border-top-color: #f5a623;
+    border-radius: 50%;
+    animation: spin 0.7s linear infinite;
+    display: block;
+  }
+
+  .tab-bar {
+    display: flex;
+    gap: 0;
+    padding: 8px 24px 0;
+    flex-shrink: 0;
+  }
+
+  .tab-btn {
+    background: none;
+    border: none;
+    border-bottom: 2px solid transparent;
+    padding: 6px 16px;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text-tertiary);
+    cursor: pointer;
+    font-family: inherit;
+    transition: color 0.15s, border-color 0.15s;
+  }
+  .tab-btn:hover {
+    color: var(--text-secondary);
+  }
+  .tab-btn.active {
+    color: var(--text-primary);
+    border-bottom-color: var(--accent-primary, #007aff);
+  }
+
+  .summary-text {
+    font-size: 14px;
+    line-height: 1.7;
+    color: var(--text-primary);
+    word-break: break-word;
+  }
+
+  /* ── Markdown rendered summary ── */
+  .summary-text.markdown-body :global(h2) {
+    font-size: 16px;
+    font-weight: 700;
+    color: var(--text-primary);
+    margin: 20px 0 8px;
+    padding-bottom: 4px;
+    border-bottom: 1px solid var(--border-divider);
+  }
+  .summary-text.markdown-body :global(h2:first-child) {
+    margin-top: 0;
+  }
+  .summary-text.markdown-body :global(h3) {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-primary);
+    margin: 16px 0 6px;
+  }
+  .summary-text.markdown-body :global(ul) {
+    margin: 4px 0 12px;
+    padding-left: 20px;
+  }
+  .summary-text.markdown-body :global(li) {
+    margin-bottom: 4px;
+    line-height: 1.6;
+  }
+  .summary-text.markdown-body :global(p) {
+    margin: 8px 0;
+  }
+  .summary-text.markdown-body :global(strong) {
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+  .summary-text.markdown-body :global(code) {
+    font-size: 13px;
+    background: var(--bg-hover);
+    padding: 1px 4px;
+    border-radius: 3px;
+  }
+
+  .content-empty {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    padding: 40px;
+  }
+
+  /* ── Context menu ── */
+  .context-menu {
+    position: fixed;
+    background: var(--bg-sidebar, #1c1c20);
+    border: 1px solid var(--border-subtle);
+    border-radius: 8px;
+    padding: 4px;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+    z-index: 1000;
+    min-width: 140px;
+  }
+  .context-menu button {
+    width: 100%;
+    text-align: left;
+    background: none;
+    border: none;
+    padding: 8px 12px;
+    border-radius: 6px;
+    font-size: 13px;
+    color: var(--text-primary);
+    cursor: pointer;
+    font-family: inherit;
+  }
+  .context-menu button:hover {
+    background: var(--bg-hover);
+  }
+  .context-menu button.danger {
+    color: #ff3b30;
+  }
+
+  .spinner-small {
+    width: 20px;
+    height: 20px;
+    border: 2px solid var(--border-subtle);
+    border-top-color: var(--text-tertiary);
+    border-radius: 50%;
+    animation: spin 0.7s linear infinite;
+  }
+  @keyframes spin {
+    to { transform: rotate(360deg); }
+  }
+</style>

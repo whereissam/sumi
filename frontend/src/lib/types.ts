@@ -148,6 +148,7 @@ export interface Settings {
   edit_hotkey: string | null;
   onboarding_completed: boolean;
   mic_device: string | null;
+  meeting_hotkey: string | null;
 }
 
 // ── History ──
@@ -228,6 +229,26 @@ export interface DownloadProgress {
   message?: string;
 }
 
+// ── Meeting Notes ──
+
+export interface MeetingNote {
+  id: string;
+  title: string;
+  transcript: string;
+  created_at: number;
+  updated_at: number;
+  duration_secs: number;
+  stt_model: string;
+  is_recording: boolean;
+  word_count: number;
+  summary: string;
+}
+
+export interface PolishedMeetingNote {
+  title: string;
+  summary: string;
+}
+
 // ── Pages ──
 
 export type Page =
@@ -235,9 +256,16 @@ export type Page =
   | 'settings'
   | 'promptRules'
   | 'dictionary'
+  | 'meeting'
   | 'history'
   | 'about'
   | 'test';
+
+// ── Streaming ──
+
+export interface TranscriptionPartialPayload {
+  text: string;
+}
 
 // ── Overlay ──
 
@@ -245,6 +273,8 @@ export type OverlayStatus =
   | 'preparing'
   | 'recording'
   | 'edit_recording'
+  | 'meeting_recording'
+  | 'meeting_stopped'
   | 'processing'
   | 'transcribing'
   | 'polishing'

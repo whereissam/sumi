@@ -1,6 +1,6 @@
 use std::path::PathBuf;
-
 use serde::{Deserialize, Serialize};
+use tauri::{AppHandle, Manager};
 
 use crate::polisher::truncate_for_error;
 use crate::settings::models_dir;
@@ -315,7 +315,7 @@ pub fn locale_to_stt_language(locale: &str) -> String {
     }
 
     // Extract the language part (before _ or -)
-    let lang = base.split(|c: char| c == '_' || c == '-').next().unwrap_or(base);
+    let lang = base.split(['_', '-']).next().unwrap_or(base);
 
     const VALID: &[&str] = &[
         "af", "am", "ar", "as", "az", "ba", "be", "bg", "bn", "bo", "br", "bs",
@@ -337,7 +337,10 @@ pub fn locale_to_stt_language(locale: &str) -> String {
 }
 
 /// Transcribe audio via a cloud STT API.
-pub fn run_cloud_stt(stt_cloud: &SttCloudConfig, samples_16k: &[f32], client: &reqwest::blocking::Client) -> Result<String, String> {
+///
+/// `prompt`: optional context text (e.g. previous transcript) for Groq/OpenAI
+/// compatible APIs. Ignored by Deepgram/Azure.
+pub fn run_cloud_stt(stt_cloud: &SttCloudConfig, samples_16k: &[f32], client: &reqwest::blocking::Client, prompt: Option<&str>) -> Result<String, String> {
     if stt_cloud.api_key.is_empty() {
         return Err("Cloud STT API key is not set. Please configure it in Settings.".to_string());
     }
@@ -466,6 +469,12 @@ pub fn run_cloud_stt(stt_cloud: &SttCloudConfig, samples_16k: &[f32], client: &r
                 }
             }
 
+            if let Some(p) = prompt {
+                if !p.is_empty() {
+                    form = form.text("prompt", p.to_string());
+                }
+            }
+
             client
                 .post(&endpoint)
                 .header("Authorization", format!("Bearer {}", stt_cloud.api_key))
@@ -524,5 +533,51 @@ pub fn run_cloud_stt(stt_cloud: &SttCloudConfig, samples_16k: &[f32], client: &r
     } else {
         Ok(text)
     }
+}
+
+// ── Cloud meeting feeder ─────────────────────────────────────────────────────
+
+/// Meeting-mode feeder for continuous long-form transcription via Cloud STT.
+///
+/// Mirrors `whisper_streaming::run_whisper_meeting_feeder_loop` but uses
+/// stateless `run_cloud_stt` HTTP calls for each silence-separated segment.
+/// API failures are logged and skipped (the meeting continues), preventing
+/// transient network issues from terminating the entire session.
+/// Meeting-mode feeder for continuous long-form transcription via cloud STT.
+///
+/// Delegates to `meeting_feeder::run_meeting_feeder` with a cloud STT transcription
+/// closure that uses the WAL context as a prompt hint.
+pub(crate) fn run_cloud_meeting_feeder_loop(
+    app: AppHandle,
+    cloud_config: SttCloudConfig,
+    language: String,
+    session_id: u64,
+) {
+    let mut cloud_config = cloud_config;
+    cloud_config.language = language;
+
+    let state = app.state::<crate::AppState>();
+    let http_client = &state.http_client;
+
+    crate::meeting_feeder::run_meeting_feeder(
+        app.clone(),
+        session_id,
+        "cloud-meeting",
+        None,
+        |samples, prev_text| {
+            let prompt = if prev_text.is_empty() {
+                None
+            } else {
+                Some(prev_text)
+            };
+            match run_cloud_stt(&cloud_config, samples, http_client, prompt) {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!("[cloud-meeting] transcription failed, skipping: {e}");
+                    String::new()
+                }
+            }
+        },
+    );
 }
 

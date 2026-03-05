@@ -1,19 +1,18 @@
-use std::sync::Mutex;
+use std::sync::{atomic::Ordering, Mutex};
+use std::time::Duration;
 
-use candle_core::Device;
+use tauri::{AppHandle, Manager};
 
 use crate::stt::{qwen3_asr_model_dir, is_qwen3_asr_downloaded, Qwen3AsrModel};
 
 // ── Cache ─────────────────────────────────────────────────────────────────────
 
 pub struct Qwen3AsrCache {
-    pub engine: qwen3_asr::inference::AsrInference,
+    pub engine: qwen3_asr::AsrInference,
     pub model: Qwen3AsrModel,
 }
 
-// SAFETY: AsrInference holds candle tensors that are not Send; we guard all
-// access with the Mutex in AppState, so only one thread touches it at a time.
-unsafe impl Send for Qwen3AsrCache {}
+// Qwen3AsrCache inherits Send+Sync from AsrInference automatically.
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -46,21 +45,8 @@ pub fn warm_qwen3_asr(
     tracing::info!("Loading Qwen3-ASR {}...", model.display_name());
     let t0 = std::time::Instant::now();
 
-    let device = if cfg!(feature = "metal") {
-        Device::new_metal(0).unwrap_or_else(|e| {
-            tracing::warn!("Metal unavailable, falling back to CPU (Qwen3-ASR will be slow): {}", e);
-            Device::Cpu
-        })
-    } else if candle_core::utils::cuda_is_available() {
-        Device::new_cuda(0).unwrap_or_else(|e| {
-            tracing::warn!("CUDA unavailable, falling back to CPU (Qwen3-ASR will be slow): {}", e);
-            Device::Cpu
-        })
-    } else {
-        tracing::warn!("No GPU acceleration available, Qwen3-ASR will run on CPU");
-        Device::Cpu
-    };
-    let engine = qwen3_asr::inference::AsrInference::load(&model_dir, device)
+    let device = qwen3_asr::best_device();
+    let engine = qwen3_asr::AsrInference::load(&model_dir, device)
         .map_err(|e| format!("Qwen3-ASR load failed: {}", e))?;
 
     tracing::info!("Qwen3-ASR {} loaded in {:.1?}", model.display_name(), t0.elapsed());
@@ -83,18 +69,50 @@ pub fn transcribe_with_cached_qwen3_asr(
     });
     let c = guard.as_ref().ok_or("Qwen3-ASR cache empty after warm")?;
 
-    let lang_opt: Option<&str> = if language == "auto" || language.is_empty() {
+    let lang_opt = if language == "auto" || language.is_empty() {
         None
     } else {
-        Some(language)
+        Some(language.to_string())
     };
 
+    let mut opts = qwen3_asr::TranscribeOptions::default();
+    if let Some(lang) = lang_opt {
+        opts = opts.with_language(lang);
+    }
     let result = c
         .engine
-        .transcribe_samples(samples, lang_opt)
+        .transcribe_samples(samples, opts)
         .map_err(|e| format!("Qwen3-ASR transcription failed: {}", e))?;
 
     Ok(result.text)
+}
+
+/// Poll until the cached Qwen3-ASR engine matches `model`, or `timeout_ms` elapses.
+///
+/// Returns `true` if the engine is ready, `false` on timeout.
+pub(crate) fn wait_engine_ready(
+    ctx: &Mutex<Option<Qwen3AsrCache>>,
+    model: &Qwen3AsrModel,
+    timeout_ms: u64,
+) -> bool {
+    let mut waited = 0u64;
+    while waited < timeout_ms {
+        let ready = ctx
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|c| c.model == *model))
+            .unwrap_or(false);
+        if ready {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        waited += 200;
+    }
+    // Final check after timeout.
+    ctx.lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|c| c.model == *model))
+        .unwrap_or(false)
 }
 
 /// Drop the cached engine so a new model can be loaded on the next call.
@@ -103,3 +121,180 @@ pub fn invalidate_qwen3_asr_cache(cache: &Mutex<Option<Qwen3AsrCache>>) {
         *guard = None;
     }
 }
+
+/// Feeder loop for live-preview streaming transcription.
+///
+/// Runs in a dedicated thread during recording. Every 2 seconds, reads the
+/// new audio delta from `AppState.buffer`, feeds it to the Qwen3-ASR streaming
+/// engine, and emits a `"transcription-partial"` event to the overlay window.
+///
+/// When `is_recording` becomes false, exits the loop, calls `finish_streaming`
+/// to flush remaining audio, stores the final text in `AppState.streaming_result`,
+/// and clears `AppState.streaming_active`.
+///
+/// `sstate` is created and used entirely within this function (i.e. within the
+/// feeder thread); it is never transferred to another thread.
+pub(crate) fn run_feeder_loop(app: AppHandle, language: String, session_id: u64) {
+    let state = app.state::<crate::AppState>();
+
+    // Read the native sample rate once (won't change during recording).
+    let sr = state.sample_rate.lock().ok().and_then(|v| *v).unwrap_or(44100);
+
+    // Initialise streaming session while holding the engine lock briefly.
+    // SAFETY: `sstate` is only used in this function / this thread.
+    let mut sstate = {
+        let guard = state.qwen3_asr_ctx.lock().unwrap_or_else(|e| e.into_inner());
+        let c = match guard.as_ref() {
+            Some(c) => c,
+            None => {
+                state.streaming_active.store(false, Ordering::SeqCst);
+                return;
+            }
+        };
+        let opts = if !language.is_empty() && language != "auto" {
+            qwen3_asr::StreamingOptions::default().with_language(&language)
+        } else {
+            qwen3_asr::StreamingOptions::default()
+        };
+        c.engine.init_streaming(opts)
+        // Lock released here. Safety: qwen3-asr StreamingState is fully owned
+        // (contains tensor buffers + KV cache, no references to AsrInference).
+        // A concurrent model switch will drop the old engine, but sstate remains
+        // valid because it does not borrow from the engine.
+    };
+
+    let mut last_tail: usize = 0;
+
+    // Main loop: every 2 s (interruptible), feed new audio to the engine.
+    loop {
+        {
+            let guard = state.feeder_stop_mu.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = state.feeder_stop_cv.wait_timeout(guard, Duration::from_millis(2000));
+        }
+        if !state.is_recording.load(Ordering::SeqCst) {
+            break;
+        }
+
+        // Read only the new delta since the last iteration.
+        let delta_raw: Vec<f32> = {
+            let buf = state.buffer.lock().unwrap_or_else(|e| e.into_inner());
+            let delta = buf[last_tail..].to_vec();
+            last_tail = buf.len();
+            delta
+        };
+        if delta_raw.is_empty() {
+            continue;
+        }
+
+        // Resample to 16 kHz if needed.
+        let delta_16k = if sr != 16000 {
+            crate::audio::resample(&delta_raw, sr, 16000)
+        } else {
+            delta_raw
+        };
+
+        // Run incremental inference (engine lock held only during this call).
+        let partial = {
+            let guard = state.qwen3_asr_ctx.lock().unwrap_or_else(|e| e.into_inner());
+            guard.as_ref().map(|c| c.engine.feed_audio(&mut sstate, &delta_16k))
+        };
+
+        if let Some(Ok(Some(result))) = partial {
+            if !result.text.is_empty() {
+                tracing::debug!("[streaming] partial: {:?}", result.text);
+                crate::emit_transcription_partial(&app, &result.text);
+            }
+        }
+    }
+
+    // If do_stop_recording timed out and signalled a cancel, skip the post-loop
+    // engine work so the batch fallback can acquire qwen3_asr_ctx without contention.
+    if state.streaming_cancelled.load(Ordering::SeqCst) {
+        tracing::info!("[streaming] cancelled — skipping trailing feed, batch fallback will handle it");
+        state.streaming_active.store(false, Ordering::SeqCst);
+        return;
+    }
+
+    // Session guard: if streaming_session has advanced past our ID, a new
+    // recording already started and this is a zombie feeder. Discard the result
+    // so we don't overwrite the new session's (possibly already stored) result.
+    if state.streaming_session.load(Ordering::SeqCst) != session_id {
+        tracing::warn!("[streaming] stale feeder (session {} vs current {}) — discarding result", session_id, state.streaming_session.load(Ordering::SeqCst));
+        state.streaming_active.store(false, Ordering::SeqCst);
+        return;
+    }
+
+    // Feed samples that arrived since the last tick (up to 2 s may be unread).
+    // IMPORTANT: do_stop_recording drains the buffer with std::mem::take *before*
+    // entering the feeder wait, so buf.len() may be 0 by the time we reach here.
+    // Clamping last_tail prevents an out-of-bounds panic.
+    {
+        let trailing_raw: Vec<f32> = {
+            let buf = state.buffer.lock().unwrap_or_else(|e| e.into_inner());
+            buf[last_tail.min(buf.len())..].to_vec()
+        };
+        if !trailing_raw.is_empty() {
+            let trailing_16k = if sr != 16000 {
+                crate::audio::resample(&trailing_raw, sr, 16000)
+            } else {
+                trailing_raw
+            };
+            let guard = state.qwen3_asr_ctx.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(c) = guard.as_ref() {
+                let _ = c.engine.feed_audio(&mut sstate, &trailing_16k);
+            }
+        }
+    }
+
+    // Flush remaining audio and store the final result.
+    let final_text = {
+        let guard = state.qwen3_asr_ctx.lock().unwrap_or_else(|e| e.into_inner());
+        guard
+            .as_ref()
+            .and_then(|c| c.engine.finish_streaming(&mut sstate).ok())
+            .map(|r| r.text)
+            .unwrap_or_default()
+    };
+    tracing::info!("[streaming] finish: {:?}", final_text);
+
+    if let Ok(mut r) = state.streaming_result.lock() {
+        *r = if final_text.is_empty() { None } else { Some(final_text) };
+    }
+    // Store result before clearing active flag (SeqCst ensures visibility ordering).
+    state.streaming_active.store(false, Ordering::SeqCst);
+}
+
+/// Meeting mode feeder loop for continuous long-form transcription with Qwen3-ASR.
+///
+/// Delegates to `meeting_feeder::run_meeting_feeder` with a Qwen3-ASR transcription
+/// closure.  Force-flushes segments at 120 s to bound per-segment inference cost.
+pub(crate) fn run_meeting_feeder_loop(app: tauri::AppHandle, language: String, session_id: u64) {
+    let state = app.state::<crate::AppState>();
+
+    let model = {
+        let settings = state.settings.lock().unwrap_or_else(|e| e.into_inner());
+        settings.stt.qwen3_asr_model.clone()
+    };
+
+    // Verify engine is available before entering the loop.
+    {
+        let guard = state.qwen3_asr_ctx.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_none() {
+            state.meeting_active.store(false, Ordering::SeqCst);
+            return;
+        }
+    }
+
+    let qwen3_ctx = &state.qwen3_asr_ctx;
+    crate::meeting_feeder::run_meeting_feeder(
+        app.clone(),
+        session_id,
+        "qwen3-meeting",
+        Some(120 * 16_000),
+        |samples, _prev_text| {
+            transcribe_with_cached_qwen3_asr(qwen3_ctx, samples, &model, &language)
+                .unwrap_or_default()
+        },
+    );
+}
+

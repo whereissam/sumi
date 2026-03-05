@@ -7,7 +7,7 @@ use crate::qwen3_asr as qwen3;
 use crate::settings::{self, Settings};
 use crate::stt::{Qwen3AsrModel, Qwen3AsrModelInfo, SttMode};
 use crate::whisper_models::{self, WhisperModel, WhisperModelInfo, SystemInfo};
-use crate::{history, AppState};
+use crate::{history, meeting_notes, AppState};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
@@ -57,6 +57,7 @@ pub fn save_settings(
     // Keep cloud.language in sync with top-level language
     current.stt.cloud.language = current.stt.language.clone();
     current.edit_hotkey = new_settings.edit_hotkey;
+    current.meeting_hotkey = new_settings.meeting_hotkey;
     current.onboarding_completed = new_settings.onboarding_completed;
     settings::save_settings_to_disk(&current);
     Ok(())
@@ -73,6 +74,17 @@ pub fn update_hotkey(
     let shortcut =
         parse_hotkey_string(&new_hotkey).ok_or_else(|| "Invalid hotkey string".to_string())?;
 
+    // Check for conflicts with existing edit/meeting hotkeys before touching shortcuts.
+    {
+        let settings = state.settings.lock().map_err(|e| e.to_string())?;
+        if settings.edit_hotkey.as_deref() == Some(new_hotkey.as_str()) {
+            return Err("Primary hotkey must differ from edit hotkey".to_string());
+        }
+        if settings.meeting_hotkey.as_deref() == Some(new_hotkey.as_str()) {
+            return Err("Primary hotkey must differ from meeting hotkey".to_string());
+        }
+    }
+
     app.global_shortcut()
         .unregister_all()
         .map_err(|e| format!("Failed to unregister shortcuts: {}", e))?;
@@ -87,7 +99,17 @@ pub fn update_hotkey(
 
     if let Some(ref edit_hk) = settings.edit_hotkey {
         if let Some(edit_shortcut) = parse_hotkey_string(edit_hk) {
-            let _ = app.global_shortcut().register(edit_shortcut);
+            if let Err(e) = app.global_shortcut().register(edit_shortcut) {
+                tracing::warn!("Failed to re-register edit hotkey: {}", e);
+            }
+        }
+    }
+
+    if let Some(ref meeting_hk) = settings.meeting_hotkey {
+        if let Some(meeting_shortcut) = parse_hotkey_string(meeting_hk) {
+            if let Err(e) = app.global_shortcut().register(meeting_shortcut) {
+                tracing::warn!("Failed to re-register meeting hotkey: {}", e);
+            }
         }
     }
 
@@ -116,19 +138,29 @@ pub fn update_edit_hotkey(
 ) -> Result<(), String> {
     use tauri_plugin_global_shortcut::GlobalShortcutExt;
 
-    app.global_shortcut()
-        .unregister_all()
-        .map_err(|e| format!("Failed to unregister shortcuts: {}", e))?;
-
+    // Validate BEFORE unregistering, so a failed validation cannot leave
+    // all shortcuts permanently unregistered (mirrors update_meeting_hotkey).
     let mut settings = state.settings.lock().map_err(|e| e.to_string())?;
 
     if let Some(ref hk) = new_edit_hotkey {
         if !hk.is_empty() {
             let _ = parse_hotkey_string(hk)
                 .ok_or_else(|| "Invalid edit hotkey string".to_string())?;
+            // Symmetric conflict check: edit hotkey must not match primary or meeting hotkey.
+            if *hk == settings.hotkey {
+                return Err("Edit hotkey must differ from primary hotkey".to_string());
+            }
+            if settings.meeting_hotkey.as_deref() == Some(hk.as_str()) {
+                return Err("Edit hotkey must differ from meeting hotkey".to_string());
+            }
         }
     }
     settings.edit_hotkey = new_edit_hotkey.filter(|s| !s.is_empty());
+
+    // Unregister only after validation succeeds.
+    app.global_shortcut()
+        .unregister_all()
+        .map_err(|e| format!("Failed to unregister shortcuts: {}", e))?;
 
     let primary = parse_hotkey_string(&settings.hotkey)
         .ok_or_else(|| "Invalid primary hotkey".to_string())?;
@@ -145,8 +177,98 @@ pub fn update_edit_hotkey(
         }
     }
 
+    if let Some(ref meeting_hk) = settings.meeting_hotkey {
+        if let Some(shortcut) = parse_hotkey_string(meeting_hk) {
+            if let Err(e) = app.global_shortcut().register(shortcut) {
+                tracing::warn!("Failed to re-register meeting hotkey: {}", e);
+            }
+        }
+    }
+
+    *state.registered_edit_shortcut.lock().map_err(|e| e.to_string())? =
+        settings.edit_hotkey.as_deref().and_then(parse_hotkey_string);
+
     settings::save_settings_to_disk(&settings);
     tracing::info!("Edit hotkey updated to: {:?}", settings.edit_hotkey);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn update_meeting_hotkey(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    hotkey: Option<String>,
+) -> Result<(), String> {
+    use tauri_plugin_global_shortcut::GlobalShortcutExt;
+
+    // Refuse if a meeting is in progress — unregistering the active hotkey
+    // would make it impossible to stop the meeting via keyboard.
+    if state.meeting_active.load(Ordering::SeqCst) {
+        return Err("Cannot change meeting hotkey while a meeting is in progress".to_string());
+    }
+
+    // Validate before making any changes so a bad hotkey string does not leave
+    // the app with no shortcuts registered (unregister_all already called).
+    let mut settings = state.settings.lock().map_err(|e| e.to_string())?;
+
+    if let Some(ref hk) = hotkey {
+        if !hk.is_empty() {
+            let _ = parse_hotkey_string(hk)
+                .ok_or_else(|| "Invalid meeting hotkey string".to_string())?;
+            // Must include at least one modifier to avoid swallowing bare keypresses.
+            let has_modifier = ["Alt+", "Control+", "Shift+", "Super+"]
+                .iter()
+                .any(|m| hk.contains(m));
+            if !has_modifier {
+                return Err("Meeting hotkey must include at least one modifier key".to_string());
+            }
+            // Must not conflict with primary or edit hotkeys.
+            if *hk == settings.hotkey {
+                return Err("Meeting hotkey must differ from primary hotkey".to_string());
+            }
+            if settings.edit_hotkey.as_deref() == Some(hk.as_str()) {
+                return Err("Meeting hotkey must differ from edit hotkey".to_string());
+            }
+        }
+    }
+    settings.meeting_hotkey = hotkey.filter(|s| !s.is_empty());
+
+    // Unregister only after validation succeeds.
+    app.global_shortcut()
+        .unregister_all()
+        .map_err(|e| format!("Failed to unregister shortcuts: {}", e))?;
+
+    // Re-register primary hotkey.
+    let primary = parse_hotkey_string(&settings.hotkey)
+        .ok_or_else(|| "Invalid primary hotkey".to_string())?;
+    app.global_shortcut()
+        .register(primary)
+        .map_err(|e| format!("Failed to register primary shortcut: {}", e))?;
+
+    // Re-register edit hotkey if set.
+    if let Some(ref edit_hk) = settings.edit_hotkey {
+        if let Some(shortcut) = parse_hotkey_string(edit_hk) {
+            if let Err(e) = app.global_shortcut().register(shortcut) {
+                tracing::warn!("Failed to re-register edit hotkey: {}", e);
+            }
+        }
+    }
+
+    // Register new meeting hotkey if set.
+    if let Some(ref meeting_hk) = settings.meeting_hotkey {
+        if let Some(shortcut) = parse_hotkey_string(meeting_hk) {
+            app.global_shortcut()
+                .register(shortcut)
+                .map_err(|e| format!("Failed to register meeting shortcut: {}", e))?;
+            tracing::info!("Meeting hotkey registered: {}", meeting_hk);
+        }
+    }
+
+    *state.registered_meeting_shortcut.lock().map_err(|e| e.to_string())? =
+        settings.meeting_hotkey.as_deref().and_then(parse_hotkey_string);
+
+    settings::save_settings_to_disk(&settings);
+    tracing::info!("Meeting hotkey updated to: {:?}", settings.meeting_hotkey);
     Ok(())
 }
 
@@ -175,6 +297,8 @@ pub fn reset_settings(app: AppHandle, state: State<'_, AppState>) -> Result<(), 
     let mut fresh = settings::load_settings();
     settings::apply_locale_defaults(&mut fresh);
     let default_hotkey = fresh.hotkey.clone();
+    let default_edit_hotkey = fresh.edit_hotkey.clone();
+    let default_meeting_hotkey = fresh.meeting_hotkey.clone();
 
     {
         let mut current = state.settings.lock().map_err(|e| e.to_string())?;
@@ -191,6 +315,30 @@ pub fn reset_settings(app: AppHandle, state: State<'_, AppState>) -> Result<(), 
     app.global_shortcut()
         .register(shortcut)
         .map_err(|e| format!("Failed to register shortcut: {}", e))?;
+
+    // Re-register edit hotkey if the default settings include one.
+    if let Some(ref edit_hk) = default_edit_hotkey {
+        if let Some(s) = parse_hotkey_string(edit_hk) {
+            if let Err(e) = app.global_shortcut().register(s) {
+                tracing::warn!("Failed to re-register edit hotkey after reset: {}", e);
+            }
+        }
+    }
+
+    // Re-register meeting hotkey if the default settings include one.
+    if let Some(ref meeting_hk) = default_meeting_hotkey {
+        if let Some(s) = parse_hotkey_string(meeting_hk) {
+            if let Err(e) = app.global_shortcut().register(s) {
+                tracing::warn!("Failed to re-register meeting hotkey after reset: {}", e);
+            }
+        }
+    }
+
+    // Update shortcut identity caches to match the newly registered shortcuts.
+    *state.registered_edit_shortcut.lock().map_err(|e| e.to_string())? =
+        default_edit_hotkey.as_deref().and_then(parse_hotkey_string);
+    *state.registered_meeting_shortcut.lock().map_err(|e| e.to_string())? =
+        default_meeting_hotkey.as_deref().and_then(parse_hotkey_string);
 
     let label = hotkey_display_label(&default_hotkey);
     if let Some(tray) = app.tray_by_id("main-tray") {
@@ -244,39 +392,60 @@ pub struct HistoryPage {
 }
 
 #[tauri::command]
-pub fn get_history_page(before_timestamp: Option<i64>, limit: Option<u32>) -> HistoryPage {
-    let limit = limit.unwrap_or(10);
-    let (entries, has_more) =
-        history::load_history_page(&settings::history_dir(), before_timestamp, limit);
-    HistoryPage { entries, has_more }
+pub async fn get_history_page(
+    before_timestamp: Option<i64>,
+    limit: Option<u32>,
+) -> Result<HistoryPage, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let limit = limit.unwrap_or(10);
+        let (entries, has_more) =
+            history::load_history_page(&settings::history_dir(), before_timestamp, limit);
+        HistoryPage { entries, has_more }
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub fn get_history_stats() -> history::HistoryStats {
-    history::get_stats(&settings::history_dir())
+pub async fn get_history_stats() -> Result<history::HistoryStats, String> {
+    tauri::async_runtime::spawn_blocking(move || history::get_stats(&settings::history_dir()))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub fn get_history() -> Vec<history::HistoryEntry> {
-    history::load_history(&settings::history_dir())
+pub async fn get_history() -> Result<Vec<history::HistoryEntry>, String> {
+    tauri::async_runtime::spawn_blocking(move || history::load_history(&settings::history_dir()))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub fn delete_history_entry(id: String) -> Result<(), String> {
-    history::delete_entry(&settings::history_dir(), &settings::audio_dir(), &id);
-    Ok(())
+pub async fn delete_history_entry(id: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        history::delete_entry(&settings::history_dir(), &settings::audio_dir(), &id);
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub fn export_history_audio(id: String) -> Result<String, String> {
-    let dest = history::export_audio(&settings::audio_dir(), &id)?;
-    Ok(dest.to_string_lossy().to_string())
+pub async fn export_history_audio(id: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let dest = history::export_audio(&settings::audio_dir(), &id)?;
+        Ok(dest.to_string_lossy().to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn clear_all_history() -> Result<(), String> {
-    history::clear_all(&settings::history_dir(), &settings::audio_dir());
-    Ok(())
+pub async fn clear_all_history() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        history::clear_all(&settings::history_dir(), &settings::audio_dir());
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -300,11 +469,11 @@ pub fn get_app_icon(bundle_id: String) -> Result<String, String> {
 #[cfg(target_os = "macos")]
 fn get_app_icon_macos(bundle_id: &str) -> Result<String, String> {
     use base64::Engine;
-    use std::ffi::c_void;
+    use std::ffi::{c_char, c_void};
 
     extern "C" {
-        fn sel_registerName(name: *const u8) -> *mut c_void;
-        fn objc_getClass(name: *const u8) -> *mut c_void;
+        fn sel_registerName(name: *const c_char) -> *mut c_void;
+        fn objc_getClass(name: *const c_char) -> *mut c_void;
         fn objc_msgSend();
     }
 
@@ -314,16 +483,16 @@ fn get_app_icon_macos(bundle_id: &str) -> Result<String, String> {
         let send_obj_obj: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> *mut c_void =
             std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
 
-        let ws_cls = objc_getClass(c"NSWorkspace".as_ptr().cast());
+        let ws_cls = objc_getClass(c"NSWorkspace".as_ptr());
         if ws_cls.is_null() {
             return Err("NSWorkspace not found".to_string());
         }
-        let workspace = send_void(ws_cls, sel_registerName(c"sharedWorkspace".as_ptr().cast()));
+        let workspace = send_void(ws_cls, sel_registerName(c"sharedWorkspace".as_ptr()));
         if workspace.is_null() {
             return Err("sharedWorkspace is null".to_string());
         }
 
-        let nsstring_cls = objc_getClass(c"NSString".as_ptr().cast());
+        let nsstring_cls = objc_getClass(c"NSString".as_ptr());
         if nsstring_cls.is_null() {
             return Err("NSString class not found".to_string());
         }
@@ -333,7 +502,7 @@ fn get_app_icon_macos(bundle_id: &str) -> Result<String, String> {
             std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
         let ns_bundle_id = send_cstr(
             nsstring_cls,
-            sel_registerName(c"stringWithUTF8String:".as_ptr().cast()),
+            sel_registerName(c"stringWithUTF8String:".as_ptr()),
             c_bundle.as_ptr(),
         );
         if ns_bundle_id.is_null() {
@@ -342,21 +511,21 @@ fn get_app_icon_macos(bundle_id: &str) -> Result<String, String> {
 
         let app_url = send_obj_obj(
             workspace,
-            sel_registerName(c"URLForApplicationWithBundleIdentifier:".as_ptr().cast()),
+            sel_registerName(c"URLForApplicationWithBundleIdentifier:".as_ptr()),
             ns_bundle_id,
         );
         if app_url.is_null() {
             return Err("App not found for bundle_id".to_string());
         }
 
-        let app_path = send_void(app_url, sel_registerName(c"path".as_ptr().cast()));
+        let app_path = send_void(app_url, sel_registerName(c"path".as_ptr()));
         if app_path.is_null() {
             return Err("Failed to get app path".to_string());
         }
 
         let icon = send_obj_obj(
             workspace,
-            sel_registerName(c"iconForFile:".as_ptr().cast()),
+            sel_registerName(c"iconForFile:".as_ptr()),
             app_path,
         );
         if icon.is_null() {
@@ -372,25 +541,25 @@ fn get_app_icon_macos(bundle_id: &str) -> Result<String, String> {
             std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
         send_set_size(
             icon,
-            sel_registerName(c"setSize:".as_ptr().cast()),
+            sel_registerName(c"setSize:".as_ptr()),
             NSSize {
                 width: 32.0,
                 height: 32.0,
             },
         );
 
-        let tiff_data = send_void(icon, sel_registerName(c"TIFFRepresentation".as_ptr().cast()));
+        let tiff_data = send_void(icon, sel_registerName(c"TIFFRepresentation".as_ptr()));
         if tiff_data.is_null() {
             return Err("Failed to get TIFF data".to_string());
         }
 
-        let bitmap_cls = objc_getClass(c"NSBitmapImageRep".as_ptr().cast());
+        let bitmap_cls = objc_getClass(c"NSBitmapImageRep".as_ptr());
         if bitmap_cls.is_null() {
             return Err("NSBitmapImageRep not found".to_string());
         }
         let bitmap_rep = send_obj_obj(
             bitmap_cls,
-            sel_registerName(c"imageRepWithData:".as_ptr().cast()),
+            sel_registerName(c"imageRepWithData:".as_ptr()),
             tiff_data,
         );
         if bitmap_rep.is_null() {
@@ -399,11 +568,11 @@ fn get_app_icon_macos(bundle_id: &str) -> Result<String, String> {
 
         let send_png: unsafe extern "C" fn(*mut c_void, *mut c_void, u64, *mut c_void) -> *mut c_void =
             std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
-        let empty_dict_cls = objc_getClass(c"NSDictionary".as_ptr().cast());
-        let empty_dict = send_void(empty_dict_cls, sel_registerName(c"dictionary".as_ptr().cast()));
+        let empty_dict_cls = objc_getClass(c"NSDictionary".as_ptr());
+        let empty_dict = send_void(empty_dict_cls, sel_registerName(c"dictionary".as_ptr()));
         let png_data = send_png(
             bitmap_rep,
-            sel_registerName(c"representationUsingType:properties:".as_ptr().cast()),
+            sel_registerName(c"representationUsingType:properties:".as_ptr()),
             4,
             empty_dict,
         );
@@ -416,8 +585,8 @@ fn get_app_icon_macos(bundle_id: &str) -> Result<String, String> {
         let send_bytes: unsafe extern "C" fn(*mut c_void, *mut c_void) -> *const u8 =
             std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
 
-        let len = send_len(png_data, sel_registerName(c"length".as_ptr().cast())) as usize;
-        let bytes_ptr = send_bytes(png_data, sel_registerName(c"bytes".as_ptr().cast()));
+        let len = send_len(png_data, sel_registerName(c"length".as_ptr())) as usize;
+        let bytes_ptr = send_bytes(png_data, sel_registerName(c"bytes".as_ptr()));
         if bytes_ptr.is_null() || len == 0 {
             return Err("PNG data is empty".to_string());
         }
@@ -435,48 +604,56 @@ pub struct TestPolishResult {
 }
 
 #[tauri::command]
-pub fn test_polish(
-    state: State<'_, AppState>,
+pub async fn test_polish(
+    app: AppHandle,
     test_text: String,
     custom_prompt: String,
 ) -> Result<TestPolishResult, String> {
-    let mut config = state.settings.lock().map_err(|e| e.to_string())?.polish.clone();
-    let model_dir = settings::models_dir();
-
-    if config.mode == polisher::PolishMode::Cloud {
-        let key = get_cached_api_key(&state.api_key_cache, config.cloud.provider.as_key());
-        if !key.is_empty() {
-            config.cloud.api_key = key;
+    let config = {
+        let state = app.state::<AppState>();
+        let mut config = state.settings.lock().map_err(|e| e.to_string())?.polish.clone();
+        if config.mode == polisher::PolishMode::Cloud {
+            let key = get_cached_api_key(&state.api_key_cache, config.cloud.provider.as_key());
+            if !key.is_empty() {
+                config.cloud.api_key = key;
+            }
         }
-    }
+        config
+    };
 
-    let default_tmpl = polisher::base_prompt_template();
-    let default_system_prompt = polisher::resolve_prompt(&default_tmpl);
-
+    let model_dir = settings::models_dir();
+    let default_system_prompt = polisher::resolve_prompt(&polisher::base_prompt_template());
     let custom_system_prompt = polisher::resolve_prompt(&custom_prompt);
 
-    let default_result = polisher::polish_with_prompt(
-        &state.llm_model,
-        &model_dir,
-        &config,
-        &default_system_prompt,
-        &test_text,
-        &state.http_client,
-    )?;
+    let app_clone = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app_clone.state::<AppState>();
 
-    let custom_result = polisher::polish_with_prompt(
-        &state.llm_model,
-        &model_dir,
-        &config,
-        &custom_system_prompt,
-        &test_text,
-        &state.http_client,
-    )?;
+        let default_result = polisher::polish_with_prompt(
+            &state.llm_model,
+            &model_dir,
+            &config,
+            &default_system_prompt,
+            &test_text,
+            &state.http_client,
+        )?;
 
-    Ok(TestPolishResult {
-        current_result: default_result,
-        edited_result: custom_result,
+        let custom_result = polisher::polish_with_prompt(
+            &state.llm_model,
+            &model_dir,
+            &config,
+            &custom_system_prompt,
+            &test_text,
+            &state.http_client,
+        )?;
+
+        Ok(TestPolishResult {
+            current_result: default_result,
+            edited_result: custom_result,
+        })
     })
+    .await
+    .map_err(|e| format!("Test polish task failed: {}", e))?
 }
 
 // ── Voice Add Rule ────────────────────────────────────────────────────────
@@ -546,33 +723,40 @@ fn parse_generated_rule(raw: &str) -> Result<GeneratedRule, String> {
 }
 
 #[tauri::command]
-pub fn generate_rule_from_description(
-    state: State<'_, AppState>,
+pub async fn generate_rule_from_description(
+    app: AppHandle,
     description: String,
 ) -> Result<GeneratedRule, String> {
-    let mut config = state
-        .settings
-        .lock()
-        .map_err(|e| e.to_string())?
-        .polish
-        .clone();
-    let model_dir = settings::models_dir();
+    let (config, model_dir) = {
+        let state = app.state::<AppState>();
+        let mut config = state
+            .settings
+            .lock()
+            .map_err(|e| e.to_string())?
+            .polish
+            .clone();
 
-    if config.mode == polisher::PolishMode::Cloud {
-        let key = get_cached_api_key(&state.api_key_cache, config.cloud.provider.as_key());
-        if !key.is_empty() {
-            config.cloud.api_key = key;
+        if config.mode == polisher::PolishMode::Cloud {
+            let key = get_cached_api_key(&state.api_key_cache, config.cloud.provider.as_key());
+            if !key.is_empty() {
+                config.cloud.api_key = key;
+            }
         }
-    }
 
-    if !polisher::is_polish_ready(&model_dir, &config) {
-        return Err("LLM not configured".to_string());
-    }
+        let model_dir = settings::models_dir();
+        if !polisher::is_polish_ready(&model_dir, &config) {
+            return Err("LLM not configured".to_string());
+        }
+        (config, model_dir)
+    };
 
-    let lang_hint = "the same language the user uses";
+    let app_clone = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app_clone.state::<AppState>();
 
-    let system_prompt = format!(
-        r#"You are a JSON generator. The user will describe a prompt rule for a speech-to-text app. Your job is to convert the description into a structured JSON object.
+        let lang_hint = "the same language the user uses";
+        let system_prompt = format!(
+            r#"You are a JSON generator. The user will describe a prompt rule for a speech-to-text app. Your job is to convert the description into a structured JSON object.
 
 Return ONLY a single JSON object with these fields:
 - "name": a short descriptive name for the rule (max 30 chars)
@@ -586,22 +770,28 @@ If you cannot determine the match target, leave match_value empty and use "app_n
 
 Write the "name" and "prompt" fields in {lang_hint}.
 Do NOT include any explanation, only the JSON object."#
-    );
+        );
 
-    let result = polisher::polish_with_prompt(
-        &state.llm_model,
-        &model_dir,
-        &config,
-        &system_prompt,
-        &description,
-        &state.http_client,
-    )?;
+        let result = polisher::polish_with_prompt(
+            &state.llm_model,
+            &model_dir,
+            &config,
+            &system_prompt,
+            &description,
+            &state.http_client,
+        )?;
 
-    parse_generated_rule(&result)
+        parse_generated_rule(&result)
+    })
+    .await
+    .map_err(|e| format!("Generate rule task failed: {}", e))?
 }
 
 #[tauri::command]
 pub fn start_recording(state: State<'_, AppState>) -> Result<(), String> {
+    if state.meeting_active.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err("meeting_mode_active".to_string());
+    }
     let device_name = state.settings.lock().ok().and_then(|s| s.mic_device.clone());
     audio::do_start_recording(
         &state.is_recording,
@@ -616,6 +806,12 @@ pub fn start_recording(state: State<'_, AppState>) -> Result<(), String> {
 
 #[tauri::command]
 pub fn stop_recording(state: State<'_, AppState>) -> Result<String, String> {
+    // Refuse to stop if meeting mode is active — the meeting hotkey must be
+    // used to end a meeting session so the transcript is handled correctly.
+    if state.meeting_active.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err("meeting_mode_active".to_string());
+    }
+
     let mut stt_config = state.settings.lock().map_err(|e| e.to_string())?.stt.clone();
     if stt_config.mode == SttMode::Cloud {
         let key = get_cached_api_key(&state.api_key_cache, stt_config.cloud.provider.as_key());
@@ -638,18 +834,11 @@ pub fn stop_recording(state: State<'_, AppState>) -> Result<String, String> {
         })
         .unwrap_or_default();
     audio::do_stop_recording(
-        &state.is_recording,
-        &state.sample_rate,
-        &state.buffer,
-        &state.whisper_ctx,
-        &state.qwen3_asr_ctx,
-        &state.http_client,
+        &state,
         &stt_config,
         &stt_language,
         "",
         &dictionary_terms,
-        &state.vad_ctx,
-        stt_config.vad_enabled,
     )
     .map(|(text, _samples)| text)
 }
@@ -691,7 +880,15 @@ pub fn set_edit_text_override(state: State<'_, AppState>, text: String) {
 
 #[tauri::command]
 pub fn cancel_recording(app: AppHandle, state: State<'_, AppState>) {
+    // If meeting mode is active, signal the feeder to discard its work
+    // (transcript, clipboard copy, history save) before hiding the overlay.
+    if state.meeting_active.load(Ordering::SeqCst) {
+        state.meeting_cancelled.store(true, Ordering::SeqCst);
+        state.meeting_active.store(false, Ordering::SeqCst);
+    }
     state.is_recording.store(false, Ordering::SeqCst);
+    // Wake any sleeping feeder immediately.
+    state.feeder_stop_cv.notify_all();
     if let Some(overlay) = app.get_webview_window("overlay") {
         platform::hide_overlay(&overlay);
     }
@@ -709,10 +906,21 @@ pub fn get_mic_status(state: State<'_, AppState>) -> MicStatus {
     use cpal::traits::{DeviceTrait, HostTrait};
     let host = cpal::default_host();
     let default_device = host.default_input_device().and_then(|d| d.name().ok());
-    let devices: Vec<String> = host
-        .input_devices()
-        .map(|devs| devs.filter_map(|d| d.name().ok()).collect())
-        .unwrap_or_default();
+    // Use CoreAudio to filter out virtual audio devices (e.g. BlackHole,
+    // Loopback, Speaker Audio Recorder) on macOS. Fall back to cpal's
+    // list with name-based filtering on other platforms.
+    let physical = crate::audio_devices::list_physical_input_device_names();
+    let devices: Vec<String> = if !physical.is_empty() {
+        physical
+    } else {
+        host.input_devices()
+            .map(|devs| {
+                devs.filter_map(|d| d.name().ok())
+                    .filter(|name| !crate::audio_devices::is_known_virtual_device(name))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
 
     // Auto-reconnect: if mic was unavailable at startup but devices exist now, try to connect.
     let mut connected = state.mic_available.load(Ordering::SeqCst);
@@ -1132,44 +1340,56 @@ pub fn download_llm_model(app: AppHandle, state: State<'_, AppState>) -> Result<
 
 #[tauri::command]
 pub fn list_polish_models(state: State<'_, AppState>) -> Vec<PolishModelInfo> {
-    let active_model = state
+    let (active_model, recommended) = state
         .settings
         .lock()
-        .map(|s| s.polish.model.clone())
+        .map(|s| {
+            let lang = if !s.stt.language.is_empty() && s.stt.language != "auto" {
+                Some(s.stt.language.clone())
+            } else {
+                s.language.clone()
+            };
+            (s.polish.model.clone(), polisher::recommend_polish_model(lang.as_deref()))
+        })
         .unwrap_or_default();
     polisher::PolishModel::all()
         .iter()
-        .map(|m| PolishModelInfo::from_model(m, &active_model))
+        .map(|m| PolishModelInfo::from_model(m, &active_model, &recommended))
         .collect()
 }
 
 #[tauri::command]
-pub fn switch_polish_model(state: State<'_, AppState>, model: polisher::PolishModel) -> Result<(), String> {
-    // Guard: refuse if recording or processing is already in progress.
-    if state.is_recording.load(Ordering::SeqCst) || state.is_processing.load(Ordering::SeqCst) {
-        return Err("Cannot switch model while recording or processing".to_string());
-    }
-
-    {
-        let mut settings = state.settings.lock().map_err(|e| e.to_string())?;
-        settings.polish.model = model.clone();
-        settings::save_settings_to_disk(&settings);
-    }
-
-    // Invalidate and pre-warm the new model if it's already downloaded
-    polisher::invalidate_cache(&state.llm_model);
-    let model_dir = settings::models_dir();
-    if model_dir.join(model.filename()).exists() {
-        if let Err(e) = polisher::warm_llm_cache(&state.llm_model, &model_dir, &model) {
-            tracing::error!("Failed to pre-warm LLM: {}", e);
+pub async fn switch_polish_model(app: AppHandle, model: polisher::PolishModel) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        // Guard: refuse if recording or processing is already in progress.
+        if state.is_recording.load(Ordering::SeqCst) || state.is_processing.load(Ordering::SeqCst) {
+            return Err("Cannot switch model while recording or processing".to_string());
         }
-    }
-    tracing::info!(
-        "Polish model switched to {}",
-        model.display_name()
-    );
 
-    Ok(())
+        {
+            let mut settings = state.settings.lock().map_err(|e| e.to_string())?;
+            settings.polish.model = model.clone();
+            settings::save_settings_to_disk(&settings);
+        }
+
+        // Invalidate and pre-warm the new model if it's already downloaded
+        polisher::invalidate_cache(&state.llm_model);
+        let model_dir = settings::models_dir();
+        if model_dir.join(model.filename()).exists() {
+            if let Err(e) = polisher::warm_llm_cache(&state.llm_model, &model_dir, &model) {
+                tracing::error!("Failed to pre-warm LLM: {}", e);
+            }
+        }
+        tracing::info!(
+            "Polish model switched to {}",
+            model.display_name()
+        );
+
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -1180,7 +1400,10 @@ pub fn download_polish_model(app: AppHandle, model: polisher::PolishModel) -> Re
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
 
     let model_path = dir.join(model.filename());
-    if model_path.exists() {
+    let tokenizer_path = model.tokenizer_filename().map(|f| dir.join(f));
+    let already_complete = model_path.exists()
+        && tokenizer_path.as_ref().is_none_or(|p| p.exists());
+    if already_complete {
         let _ = app.emit("polish-model-download-progress", serde_json::json!({
             "status": "complete",
             "downloaded": 0u64,
@@ -1303,6 +1526,30 @@ pub fn download_polish_model(app: AppHandle, model: polisher::PolishModel) -> Re
             return;
         }
 
+        // Download external tokenizer JSON if required (e.g. Phi-4-mini).
+        if let (Some(tok_url), Some(tok_path)) = (model.tokenizer_url(), tokenizer_path.as_ref()) {
+            if !tok_path.exists() {
+                match client.get(tok_url).send().and_then(|r| r.bytes()) {
+                    Ok(bytes) => {
+                        if let Err(e) = std::fs::write(tok_path, &bytes) {
+                            let _ = app.emit("polish-model-download-progress", serde_json::json!({
+                                "status": "error",
+                                "message": format!("Failed to write tokenizer: {}", e)
+                            }));
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = app.emit("polish-model-download-progress", serde_json::json!({
+                            "status": "error",
+                            "message": format!("Failed to download tokenizer: {}", e)
+                        }));
+                        return;
+                    }
+                }
+            }
+        }
+
         if let Some(app_state) = app.try_state::<AppState>() {
             polisher::invalidate_cache(&app_state.llm_model);
         }
@@ -1362,67 +1609,72 @@ pub fn get_whisper_model_recommendation(state: State<'_, AppState>) -> WhisperMo
 }
 
 #[tauri::command]
-pub fn switch_whisper_model(app: AppHandle, state: State<'_, AppState>, model: WhisperModel) -> Result<(), String> {
-    // Atomically claim the switching slot — prevents concurrent calls from racing.
-    if state.model_switching.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
-        return Err("Model switch already in progress".to_string());
-    }
-
-    // Guard: refuse if recording or processing is already in progress.
-    if state.is_recording.load(Ordering::SeqCst) || state.is_processing.load(Ordering::SeqCst) {
-        state.model_switching.store(false, Ordering::SeqCst);
-        return Err("Cannot switch model while recording or processing".to_string());
-    }
-
-    match state.settings.lock() {
-        Ok(mut s) => {
-            s.stt.whisper_model = model.clone();
-            settings::save_settings_to_disk(&s);
+pub async fn switch_whisper_model(app: AppHandle, model: WhisperModel) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        // Atomically claim the switching slot — prevents concurrent calls from racing.
+        if state.model_switching.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+            return Err("Model switch already in progress".to_string());
         }
-        Err(e) => {
+
+        // Guard: refuse if recording or processing is already in progress.
+        if state.is_recording.load(Ordering::SeqCst) || state.is_processing.load(Ordering::SeqCst) {
             state.model_switching.store(false, Ordering::SeqCst);
-            return Err(e.to_string());
+            return Err("Cannot switch model while recording or processing".to_string());
         }
-    }
 
-    // Show overlay on main thread (Cocoa APIs are thread-affine).
-    {
-        let app2 = app.clone();
-        let _ = app.run_on_main_thread(move || {
-            if let Some(ov) = app2.get_webview_window("overlay") {
-                platform::show_overlay(&ov);
-                let _ = ov.emit("model-switching", serde_json::json!({"status": "start"}));
+        match state.settings.lock() {
+            Ok(mut s) => {
+                s.stt.whisper_model = model.clone();
+                settings::save_settings_to_disk(&s);
             }
-        });
-    }
-
-    // Pre-warm the new model. Use catch_unwind so model_switching is always cleared
-    // even if whisper-rs panics on a corrupt model file.
-    let warm_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        crate::transcribe::warm_whisper_cache(&state.whisper_ctx, &model)
-    }));
-
-    // Emit "done" and hide overlay on the main thread, then clear the flag —
-    // keeping model_switching=true until the UI transition is finished so the
-    // hotkey cannot fire in the gap between warm completion and overlay hide.
-    {
-        let app2 = app.clone();
-        let _ = app.run_on_main_thread(move || {
-            if let Some(ov) = app2.get_webview_window("overlay") {
-                let _ = ov.emit("model-switching", serde_json::json!({"status": "done"}));
-                platform::hide_overlay(&ov);
+            Err(e) => {
+                state.model_switching.store(false, Ordering::SeqCst);
+                return Err(e.to_string());
             }
-            app2.state::<AppState>().model_switching.store(false, Ordering::SeqCst);
-        });
-    }
+        }
 
-    match warm_result {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => tracing::error!("Failed to pre-warm whisper model: {}", e),
-        Err(_) => tracing::error!("Whisper model pre-warm panicked"),
-    }
+        // Show overlay on main thread (Cocoa APIs are thread-affine).
+        {
+            let app2 = app.clone();
+            let _ = app.run_on_main_thread(move || {
+                if let Some(ov) = app2.get_webview_window("overlay") {
+                    platform::show_overlay(&ov);
+                    let _ = ov.emit("model-switching", serde_json::json!({"status": "start"}));
+                }
+            });
+        }
 
-    Ok(())
+        // Pre-warm the new model. Use catch_unwind so model_switching is always cleared
+        // even if whisper-rs panics on a corrupt model file.
+        let warm_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::transcribe::warm_whisper_cache(&state.whisper_ctx, &model)
+        }));
+
+        // Emit "done" and hide overlay on the main thread, then clear the flag —
+        // keeping model_switching=true until the UI transition is finished so the
+        // hotkey cannot fire in the gap between warm completion and overlay hide.
+        {
+            let app2 = app.clone();
+            let _ = app.run_on_main_thread(move || {
+                if let Some(ov) = app2.get_webview_window("overlay") {
+                    let _ = ov.emit("model-switching", serde_json::json!({"status": "done"}));
+                    platform::hide_overlay(&ov);
+                }
+                app2.state::<AppState>().model_switching.store(false, Ordering::SeqCst);
+            });
+        }
+
+        match warm_result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::error!("Failed to pre-warm whisper model: {}", e),
+            Err(_) => tracing::error!("Whisper model pre-warm panicked"),
+        }
+
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -1905,76 +2157,80 @@ pub fn list_qwen3_asr_models(state: State<'_, AppState>) -> Vec<Qwen3AsrModelInf
 }
 
 #[tauri::command]
-pub fn switch_qwen3_asr_model(
+pub async fn switch_qwen3_asr_model(
     app: AppHandle,
-    state: State<'_, AppState>,
     model: Qwen3AsrModel,
 ) -> Result<(), String> {
-    // Atomically claim the switching slot — prevents concurrent calls from racing.
-    if state.model_switching.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
-        return Err("Model switch already in progress".to_string());
-    }
-
-    // Guard: refuse if recording or processing is already in progress.
-    if state.is_recording.load(Ordering::SeqCst) || state.is_processing.load(Ordering::SeqCst) {
-        state.model_switching.store(false, Ordering::SeqCst);
-        return Err("Cannot switch model while recording or processing".to_string());
-    }
-
-    match state.settings.lock() {
-        Ok(mut s) => {
-            s.stt.qwen3_asr_model = model.clone();
-            settings::save_settings_to_disk(&s);
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        // Atomically claim the switching slot — prevents concurrent calls from racing.
+        if state.model_switching.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+            return Err("Model switch already in progress".to_string());
         }
-        Err(e) => {
+
+        // Guard: refuse if recording or processing is already in progress.
+        if state.is_recording.load(Ordering::SeqCst) || state.is_processing.load(Ordering::SeqCst) {
             state.model_switching.store(false, Ordering::SeqCst);
-            return Err(e.to_string());
-        }
-    }
-
-    // Invalidate stale cache so next transcription loads the new model.
-    qwen3::invalidate_qwen3_asr_cache(&state.qwen3_asr_ctx);
-
-    // Pre-warm inline if already downloaded.
-    if crate::stt::is_qwen3_asr_downloaded(&model) {
-        // Show overlay on main thread (Cocoa APIs are thread-affine).
-        {
-            let app2 = app.clone();
-            let _ = app.run_on_main_thread(move || {
-                if let Some(ov) = app2.get_webview_window("overlay") {
-                    platform::show_overlay(&ov);
-                    let _ = ov.emit("model-switching", serde_json::json!({"status": "start"}));
-                }
-            });
+            return Err("Cannot switch model while recording or processing".to_string());
         }
 
-        // Pre-warm. Use catch_unwind so model_switching is always cleared on panic.
-        let warm_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            qwen3::warm_qwen3_asr(&state.qwen3_asr_ctx, &model)
-        }));
-
-        // Emit "done" and hide overlay on the main thread, then clear the flag.
-        {
-            let app2 = app.clone();
-            let _ = app.run_on_main_thread(move || {
-                if let Some(ov) = app2.get_webview_window("overlay") {
-                    let _ = ov.emit("model-switching", serde_json::json!({"status": "done"}));
-                    platform::hide_overlay(&ov);
-                }
-                app2.state::<AppState>().model_switching.store(false, Ordering::SeqCst);
-            });
+        match state.settings.lock() {
+            Ok(mut s) => {
+                s.stt.qwen3_asr_model = model.clone();
+                settings::save_settings_to_disk(&s);
+            }
+            Err(e) => {
+                state.model_switching.store(false, Ordering::SeqCst);
+                return Err(e.to_string());
+            }
         }
 
-        match warm_result {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => tracing::warn!("switch_qwen3_asr_model: pre-warm failed: {}", e),
-            Err(_) => tracing::error!("switch_qwen3_asr_model: pre-warm panicked"),
+        // Invalidate stale cache so next transcription loads the new model.
+        qwen3::invalidate_qwen3_asr_cache(&state.qwen3_asr_ctx);
+
+        // Pre-warm inline if already downloaded.
+        if crate::stt::is_qwen3_asr_downloaded(&model) {
+            // Show overlay on main thread (Cocoa APIs are thread-affine).
+            {
+                let app2 = app.clone();
+                let _ = app.run_on_main_thread(move || {
+                    if let Some(ov) = app2.get_webview_window("overlay") {
+                        platform::show_overlay(&ov);
+                        let _ = ov.emit("model-switching", serde_json::json!({"status": "start"}));
+                    }
+                });
+            }
+
+            // Pre-warm. Use catch_unwind so model_switching is always cleared on panic.
+            let warm_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                qwen3::warm_qwen3_asr(&state.qwen3_asr_ctx, &model)
+            }));
+
+            // Emit "done" and hide overlay on the main thread, then clear the flag.
+            {
+                let app2 = app.clone();
+                let _ = app.run_on_main_thread(move || {
+                    if let Some(ov) = app2.get_webview_window("overlay") {
+                        let _ = ov.emit("model-switching", serde_json::json!({"status": "done"}));
+                        platform::hide_overlay(&ov);
+                    }
+                    app2.state::<AppState>().model_switching.store(false, Ordering::SeqCst);
+                });
+            }
+
+            match warm_result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::warn!("switch_qwen3_asr_model: pre-warm failed: {}", e),
+                Err(_) => tracing::error!("switch_qwen3_asr_model: pre-warm panicked"),
+            }
+        } else {
+            // Model not yet downloaded — clear the flag immediately (no overlay needed).
+            state.model_switching.store(false, Ordering::SeqCst);
         }
-    } else {
-        // Model not yet downloaded — clear the flag immediately (no overlay needed).
-        state.model_switching.store(false, Ordering::SeqCst);
-    }
-    Ok(())
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -2134,4 +2390,337 @@ pub fn download_qwen3_asr_model(
     });
 
     Ok(())
+}
+
+// ── Model deletion ─────────────────────────────────────────────────────────
+
+/// Guard helper: returns Err if recording, processing, downloading, or switching.
+fn guard_model_op(state: &AppState) -> Result<(), String> {
+    if state.is_recording.load(Ordering::SeqCst) || state.is_processing.load(Ordering::SeqCst) {
+        return Err("Cannot delete model while recording or processing".to_string());
+    }
+    if state.downloading.load(Ordering::SeqCst) {
+        return Err("Cannot delete model while a download is in progress".to_string());
+    }
+    if state.model_switching.load(Ordering::SeqCst) {
+        return Err("Cannot delete model while switching models".to_string());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn delete_whisper_model(
+    state: State<'_, AppState>,
+    model: WhisperModel,
+) -> Result<u64, String> {
+    guard_model_op(&state)?;
+
+    let path = settings::models_dir().join(model.filename());
+    if !path.exists() {
+        return Err("Model file not found".to_string());
+    }
+
+    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+
+    // Invalidate whisper cache if this model is currently loaded.
+    if let Ok(mut cache) = state.whisper_ctx.lock() {
+        if let Some(ref c) = *cache {
+            if c.loaded_path == path {
+                *cache = None;
+                tracing::info!("Whisper cache invalidated for deleted model");
+            }
+        }
+    }
+
+    std::fs::remove_file(&path).map_err(|e| format!("Failed to delete model: {}", e))?;
+    tracing::info!("Deleted whisper model {:?}, freed {} bytes", model.display_name(), size);
+    Ok(size)
+}
+
+#[tauri::command]
+pub fn delete_polish_model(
+    state: State<'_, AppState>,
+    model: polisher::PolishModel,
+) -> Result<u64, String> {
+    guard_model_op(&state)?;
+
+    let dir = settings::models_dir();
+    let path = dir.join(model.filename());
+    if !path.exists() {
+        return Err("Model file not found".to_string());
+    }
+
+    let mut freed = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+
+    // Invalidate LLM cache if this model is currently loaded.
+    polisher::invalidate_cache(&state.llm_model);
+
+    std::fs::remove_file(&path).map_err(|e| format!("Failed to delete model: {}", e))?;
+
+    // Also remove companion tokenizer file if present.
+    if let Some(tok) = model.tokenizer_filename() {
+        let tok_path = dir.join(tok);
+        if tok_path.exists() {
+            freed += std::fs::metadata(&tok_path).map(|m| m.len()).unwrap_or(0);
+            let _ = std::fs::remove_file(&tok_path);
+        }
+    }
+
+    tracing::info!("Deleted polish model {:?}, freed {} bytes", model.display_name(), freed);
+    Ok(freed)
+}
+
+#[tauri::command]
+pub fn delete_qwen3_asr_model(
+    state: State<'_, AppState>,
+    model: Qwen3AsrModel,
+) -> Result<u64, String> {
+    guard_model_op(&state)?;
+
+    let model_dir = crate::stt::qwen3_asr_model_dir(&model);
+    if !model_dir.exists() {
+        return Err("Model directory not found".to_string());
+    }
+
+    // Calculate total size before deletion.
+    let freed: u64 = model
+        .required_files()
+        .iter()
+        .filter_map(|f| std::fs::metadata(model_dir.join(f)).ok())
+        .map(|m| m.len())
+        .sum();
+
+    // Invalidate Qwen3-ASR cache.
+    qwen3::invalidate_qwen3_asr_cache(&state.qwen3_asr_ctx);
+
+    std::fs::remove_dir_all(&model_dir)
+        .map_err(|e| format!("Failed to delete model directory: {}", e))?;
+
+    tracing::info!("Deleted Qwen3-ASR model {:?}, freed {} bytes", model.display_name(), freed);
+    Ok(freed)
+}
+
+#[tauri::command]
+pub fn delete_vad_model(state: State<'_, AppState>) -> Result<u64, String> {
+    guard_model_op(&state)?;
+
+    let path = crate::transcribe::vad_model_path();
+    if !path.exists() {
+        return Err("VAD model not found".to_string());
+    }
+
+    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+
+    // Invalidate VAD cache.
+    if let Ok(mut cache) = state.vad_ctx.lock() {
+        *cache = None;
+    }
+
+    std::fs::remove_file(&path).map_err(|e| format!("Failed to delete VAD model: {}", e))?;
+    tracing::info!("Deleted VAD model, freed {} bytes", size);
+    Ok(size)
+}
+
+// ── Meeting Notes ──
+
+#[tauri::command]
+pub fn list_meeting_notes() -> Vec<meeting_notes::MeetingNote> {
+    meeting_notes::list_notes(&settings::history_dir())
+}
+
+#[tauri::command]
+pub fn get_meeting_note(id: String) -> Result<meeting_notes::MeetingNote, String> {
+    meeting_notes::get_note(&settings::history_dir(), &id)
+}
+
+#[tauri::command]
+pub fn rename_meeting_note(id: String, title: String) -> Result<(), String> {
+    meeting_notes::rename_note(&settings::history_dir(), &id, &title)
+}
+
+#[tauri::command]
+pub fn delete_meeting_note(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<(), String> {
+    let active_id = state
+        .active_meeting_note_id
+        .lock()
+        .ok()
+        .and_then(|n| n.clone());
+    if active_id.as_deref() == Some(&id) {
+        return Err("Cannot delete the currently-recording meeting note".to_string());
+    }
+    meeting_notes::delete_note(&settings::history_dir(), &id)
+}
+
+#[tauri::command]
+pub fn delete_all_meeting_notes() -> Result<(), String> {
+    meeting_notes::delete_all_notes(&settings::history_dir())
+}
+
+#[tauri::command]
+pub fn get_active_meeting_note_id(state: State<'_, AppState>) -> Option<String> {
+    state
+        .active_meeting_note_id
+        .lock()
+        .ok()
+        .and_then(|nid| nid.clone())
+}
+
+#[derive(Serialize)]
+pub struct PolishedMeetingNote {
+    pub title: String,
+    pub summary: String,
+}
+
+#[tauri::command]
+pub async fn polish_meeting_note(
+    app: AppHandle,
+    id: String,
+) -> Result<PolishedMeetingNote, String> {
+    let history_dir = settings::history_dir();
+    let note = meeting_notes::get_note(&history_dir, &id)?;
+    if note.transcript.is_empty() {
+        return Err("Transcript is empty".to_string());
+    }
+
+    // Extract config and validate before spawning the blocking task.
+    let (config, model_dir, stt_language) = {
+        let state = app.state::<AppState>();
+        let settings = state.settings.lock().map_err(|e| e.to_string())?;
+        let mut config = settings.polish.clone();
+        let stt_language = settings.stt.language.clone();
+        drop(settings);
+
+        if config.mode == polisher::PolishMode::Cloud {
+            let key = get_cached_api_key(&state.api_key_cache, config.cloud.provider.as_key());
+            if !key.is_empty() {
+                config.cloud.api_key = key;
+            }
+        }
+
+        let model_dir = settings::models_dir();
+        if !polisher::is_polish_ready(&model_dir, &config) {
+            return Err("LLM not configured".to_string());
+        }
+        (config, model_dir, stt_language)
+    };
+
+    let transcript = note.transcript.clone();
+    let fallback_title = note.title.clone();
+
+    // Run the heavy LLM inference on a blocking thread so the UI stays responsive.
+    let app_clone = app.clone();
+    let parsed = tauri::async_runtime::spawn_blocking(move || {
+        let state = app_clone.state::<AppState>();
+
+        let lang_name = language_display_name(&stt_language);
+        let system_prompt = format!(
+            r#"You are a meeting notes assistant. Given a raw speech-to-text transcript, generate:
+1. A concise, descriptive title (max 60 chars)
+2. A well-structured Markdown summary with these sections:
+
+## Key Points
+- Main discussion topics and highlights
+
+## Action Items
+- Specific tasks, owners if mentioned
+
+## Decisions
+- What was agreed upon or decided
+
+Omit any section that has no relevant content.
+Return ONLY a JSON object: {{"title": "...", "summary": "..."}}
+The summary field must contain valid Markdown.
+Write entirely in {lang_name}."#
+        );
+
+        let result = polisher::polish_with_prompt(
+            &state.llm_model,
+            &model_dir,
+            &config,
+            &system_prompt,
+            &transcript,
+            &state.http_client,
+        )?;
+
+        Ok::<_, String>(parse_polish_json(&result, &fallback_title))
+    })
+    .await
+    .map_err(|e| format!("Polish task failed: {}", e))??;
+
+    meeting_notes::save_summary(&history_dir, &id, &parsed.title, &parsed.summary)?;
+
+    Ok(parsed)
+}
+
+fn language_display_name(bcp47: &str) -> &'static str {
+    match bcp47 {
+        "zh-TW" => "繁體中文 (Traditional Chinese)",
+        "zh-CN" | "zh" => "简体中文 (Simplified Chinese)",
+        "en" => "English",
+        "ja" => "日本語 (Japanese)",
+        "ko" => "한국어 (Korean)",
+        "es" => "Español (Spanish)",
+        "fr" => "Français (French)",
+        "de" => "Deutsch (German)",
+        "pt" => "Português (Portuguese)",
+        "it" => "Italiano (Italian)",
+        "ru" => "Русский (Russian)",
+        "ar" => "العربية (Arabic)",
+        "hi" => "हिन्दी (Hindi)",
+        "th" => "ไทย (Thai)",
+        "vi" => "Tiếng Việt (Vietnamese)",
+        "id" => "Bahasa Indonesia (Indonesian)",
+        "ms" => "Bahasa Melayu (Malay)",
+        "nl" => "Nederlands (Dutch)",
+        "pl" => "Polski (Polish)",
+        "tr" => "Türkçe (Turkish)",
+        "uk" => "Українська (Ukrainian)",
+        "sv" => "Svenska (Swedish)",
+        "da" => "Dansk (Danish)",
+        "fi" => "Suomi (Finnish)",
+        "no" => "Norsk (Norwegian)",
+        "cs" => "Čeština (Czech)",
+        "ro" => "Română (Romanian)",
+        "hu" => "Magyar (Hungarian)",
+        "el" => "Ελληνικά (Greek)",
+        "he" => "עברית (Hebrew)",
+        "auto" | "" => "the same language as the transcript",
+        _ => "the same language as the transcript",
+    }
+}
+
+fn parse_polish_json(raw: &str, fallback_title: &str) -> PolishedMeetingNote {
+    // Strip markdown code fences if present
+    let cleaned = raw
+        .trim()
+        .strip_prefix("```json")
+        .or_else(|| raw.trim().strip_prefix("```"))
+        .unwrap_or(raw.trim());
+    let cleaned = cleaned
+        .strip_suffix("```")
+        .unwrap_or(cleaned)
+        .trim();
+
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(cleaned) {
+        let title = v
+            .get("title")
+            .and_then(|t| t.as_str())
+            .unwrap_or(fallback_title)
+            .to_string();
+        let summary = v
+            .get("summary")
+            .and_then(|s| s.as_str())
+            .unwrap_or(cleaned)
+            .to_string();
+        PolishedMeetingNote { title, summary }
+    } else {
+        // Fallback: use raw output as summary, keep existing title
+        PolishedMeetingNote {
+            title: fallback_title.to_string(),
+            summary: raw.trim().to_string(),
+        }
+    }
 }

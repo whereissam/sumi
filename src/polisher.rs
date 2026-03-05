@@ -5,7 +5,6 @@ use std::sync::Mutex;
 use unicode_segmentation::UnicodeSegmentation;
 
 use candle_core::quantized::gguf_file;
-use candle_core::quantized::tokenizer::TokenizerFromGguf;
 use candle_core::{Device, Tensor};
 use candle_transformers::generation::{LogitsProcessor, Sampling};
 
@@ -62,9 +61,11 @@ pub enum PolishMode {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum CloudProvider {
     #[serde(rename = "github_models")]
     GitHubModels,
+    #[default]
     Groq,
     OpenRouter,
     OpenAi,
@@ -73,11 +74,6 @@ pub enum CloudProvider {
     Custom,
 }
 
-impl Default for CloudProvider {
-    fn default() -> Self {
-        Self::Groq
-    }
-}
 
 impl CloudProvider {
     /// Returns the snake_case identifier matching the serde serialization.
@@ -107,6 +103,7 @@ impl CloudProvider {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct CloudConfig {
     #[serde(default)]
     pub provider: CloudProvider,
@@ -118,16 +115,6 @@ pub struct CloudConfig {
     pub model_id: String,
 }
 
-impl Default for CloudConfig {
-    fn default() -> Self {
-        Self {
-            provider: CloudProvider::default(),
-            api_key: String::new(),
-            endpoint: String::new(),
-            model_id: String::new(),
-        }
-    }
-}
 
 impl CloudConfig {
     /// Returns the default model ID for the given locale.
@@ -144,12 +131,14 @@ impl CloudConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum PolishModel {
     /// Phi-4-mini-instruct — default for English and other languages.
     /// Accepts legacy "phi35_mini", "phi4_mini", "phi4_mm" serde aliases for transparent migration.
     #[serde(rename = "phi4_mini")]
     #[serde(alias = "phi35_mini")]
     #[serde(alias = "phi4_mm")]
+    #[default]
     Phi4Mm,
     #[serde(rename = "ministral3b")]
     Ministral3B,
@@ -162,11 +151,6 @@ pub enum PolishModel {
     Unknown,
 }
 
-impl Default for PolishModel {
-    fn default() -> Self {
-        Self::Phi4Mm
-    }
-}
 
 impl PolishModel {
     pub fn filename(&self) -> &'static str {
@@ -239,7 +223,8 @@ impl PolishModel {
     pub fn tokenizer_filename(&self) -> Option<&'static str> {
         match self {
             PolishModel::Phi4Mm | PolishModel::Unknown => Some("phi4_mini_tokenizer.json"),
-            PolishModel::Qwen3_4B | PolishModel::Ministral3B => None,
+            PolishModel::Qwen3_4B => Some("qwen3_4b_tokenizer.json"),
+            PolishModel::Ministral3B => Some("ministral3b_tokenizer.json"),
         }
     }
 
@@ -249,7 +234,12 @@ impl PolishModel {
             PolishModel::Phi4Mm | PolishModel::Unknown => Some(
                 "https://huggingface.co/microsoft/Phi-4-mini-instruct/resolve/main/tokenizer.json",
             ),
-            PolishModel::Qwen3_4B | PolishModel::Ministral3B => None,
+            PolishModel::Qwen3_4B => Some(
+                "https://huggingface.co/Qwen/Qwen3-4B/resolve/main/tokenizer.json",
+            ),
+            PolishModel::Ministral3B => Some(
+                "https://huggingface.co/mistralai/Ministral-3B-Instruct-2410/resolve/main/tokenizer.json",
+            ),
         }
     }
 }
@@ -478,10 +468,10 @@ pub fn default_prompt_rules() -> Vec<PromptRule> {
 /// Falls back to English when a translation is not available.
 pub fn default_prompt_rules_for_lang(lang: Option<&str>) -> Vec<PromptRule> {
     let lower = lang.map(|l| l.to_lowercase());
-    let is_zh_tw = lower.as_deref().map_or(false, |l| {
+    let is_zh_tw = lower.as_deref().is_some_and(|l| {
         l.starts_with("zh-tw") || l.starts_with("zh_tw") || l.starts_with("zh-hant")
     });
-    let is_zh = lower.as_deref().map_or(false, |l| l.starts_with("zh"));
+    let is_zh = lower.as_deref().is_some_and(|l| l.starts_with("zh"));
 
     let (code_editor_prompt, ai_cli_prompt, chat_prompt, email_prompt, notion_prompt, slack_prompt, github_prompt, twitter_prompt) = if is_zh_tw {
         (
@@ -1368,7 +1358,7 @@ pub fn validate_gguf_file(path: &std::path::Path, expected_model: &PolishModel) 
     f.read_exact(&mut version_bytes)
         .map_err(|e| format!("Cannot read GGUF version: {}", e))?;
     let version = u32::from_le_bytes(version_bytes);
-    if version < 2 || version > 3 {
+    if !(2..=3).contains(&version) {
         return Err(format!("Unsupported GGUF version: {}", version));
     }
 
@@ -1476,13 +1466,12 @@ fn ensure_llm_loaded(
 
         // Load tokenizer — from external JSON for models with non-gpt2 GGUF tokenizers
         // (e.g. Phi-3.5-mini uses SentencePiece/llama type), else from GGUF metadata.
-        let tokenizer = if let Some(tok_filename) = polish_model.tokenizer_filename() {
+        let tokenizer = {
+            let tok_filename = polish_model.tokenizer_filename()
+                .ok_or("Model has no tokenizer configured")?;
             let tok_path = model_path.parent().unwrap_or(model_path).join(tok_filename);
             tokenizers::Tokenizer::from_file(&tok_path)
                 .map_err(|e| format!("Load tokenizer from {}: {}", tok_path.display(), e))?
-        } else {
-            tokenizers::Tokenizer::from_gguf(&content)
-                .map_err(|e| format!("Load tokenizer from GGUF: {}", e))?
         };
 
         // Load model weights (consumes content; file reader is positioned at tensor data)
@@ -1604,8 +1593,8 @@ pub fn validate_custom_endpoint(url_str: &str) -> Result<(), String> {
             || host == "127.0.0.1"
             || host == "::1"
             || host == "0.0.0.0"
-            || host.parse::<std::net::Ipv4Addr>().map_or(false, |ip| ip.is_private())
-            || host.parse::<std::net::IpAddr>().map_or(false, |ip| match ip {
+            || host.parse::<std::net::Ipv4Addr>().is_ok_and(|ip| ip.is_private())
+            || host.parse::<std::net::IpAddr>().is_ok_and(|ip| match ip {
                 // IPv6 ULA (fc00::/7) — private routable IPv6
                 std::net::IpAddr::V6(v6) => (v6.segments()[0] & 0xfe00) == 0xfc00,
                 _ => false,

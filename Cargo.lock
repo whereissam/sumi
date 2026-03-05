@@ -341,6 +341,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "bindgen_cuda"
+version = "0.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "282be55fb326843bb67cccceeeaf21c961ef303f60018f9a2ab69494dad8eaf9"
+dependencies = [
+ "glob",
+ "num_cpus",
+ "rayon",
+]
+
+[[package]]
 name = "bit-set"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -512,14 +523,15 @@ dependencies = [
 [[package]]
 name = "candle-core"
 version = "0.9.2"
-source = "git+https://github.com/huggingface/candle.git?rev=38e7202145a8d264cf78e824edf2c31f6a438cdf#38e7202145a8d264cf78e824edf2c31f6a438cdf"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c15b675b80d994b2eadb20a4bbe434eabeb454eac3ee5e2b4cf6f147ee9be091"
 dependencies = [
  "byteorder",
  "candle-kernels",
  "candle-metal-kernels",
  "candle-ug",
  "cudarc 0.19.3",
- "float8",
+ "float8 0.6.1",
  "gemm 0.19.0",
  "half",
  "libm",
@@ -533,7 +545,6 @@ dependencies = [
  "rayon",
  "safetensors 0.7.0",
  "thiserror 2.0.18",
- "tokenizers",
  "yoke 0.8.1",
  "zip 7.2.0",
 ]
@@ -541,15 +552,17 @@ dependencies = [
 [[package]]
 name = "candle-kernels"
 version = "0.9.2"
-source = "git+https://github.com/huggingface/candle.git?rev=38e7202145a8d264cf78e824edf2c31f6a438cdf#38e7202145a8d264cf78e824edf2c31f6a438cdf"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b8455f84bd810047c7c41216683c1020c915a9f8a740b3b0eabdd4fb2fbaa660"
 dependencies = [
- "cudaforge",
+ "bindgen_cuda",
 ]
 
 [[package]]
 name = "candle-metal-kernels"
 version = "0.9.2"
-source = "git+https://github.com/huggingface/candle.git?rev=38e7202145a8d264cf78e824edf2c31f6a438cdf#38e7202145a8d264cf78e824edf2c31f6a438cdf"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2fdfe9d06de16ce49961e49084e5b79a75a9bdf157246e7c7b6328e87a7aa25d"
 dependencies = [
  "half",
  "objc2",
@@ -563,7 +576,8 @@ dependencies = [
 [[package]]
 name = "candle-nn"
 version = "0.9.2"
-source = "git+https://github.com/huggingface/candle.git?rev=38e7202145a8d264cf78e824edf2c31f6a438cdf#38e7202145a8d264cf78e824edf2c31f6a438cdf"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3045fa9e7aef8567d209a27d56b692f60b96f4d0569f4c3011f8ca6715c65e03"
 dependencies = [
  "candle-core",
  "candle-metal-kernels",
@@ -580,7 +594,8 @@ dependencies = [
 [[package]]
 name = "candle-transformers"
 version = "0.9.2"
-source = "git+https://github.com/huggingface/candle.git?rev=38e7202145a8d264cf78e824edf2c31f6a438cdf#38e7202145a8d264cf78e824edf2c31f6a438cdf"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b538ec4aa807c416a2ddd3621044888f188827862e2a6fcacba4738e89795d01"
 dependencies = [
  "byteorder",
  "candle-core",
@@ -598,7 +613,8 @@ dependencies = [
 [[package]]
 name = "candle-ug"
 version = "0.9.2"
-source = "git+https://github.com/huggingface/candle.git?rev=38e7202145a8d264cf78e824edf2c31f6a438cdf#38e7202145a8d264cf78e824edf2c31f6a438cdf"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c22d62be69068bf58987a45f690612739d8d2ea1bf508c1b87dc6815a019575d"
 dependencies = [
  "ug",
  "ug-cuda",
@@ -1021,25 +1037,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cudaforge"
-version = "0.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3ac9cd50bed6f024583322f1a5b8027eabef203086ccceb27aac1b0b58515a32"
-dependencies = [
- "anyhow",
- "fs2",
- "glob",
- "num_cpus",
- "rayon",
- "serde",
- "serde_json",
- "sha2",
- "thiserror 2.0.18",
- "walkdir",
- "which",
-]
-
-[[package]]
 name = "cudarc"
 version = "0.17.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1055,7 +1052,7 @@ version = "0.19.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6468cb7fa330840f3ebcd8df51edc0e7bf5c18df524792ce6004c6821851cdf3"
 dependencies = [
- "float8",
+ "float8 0.7.0",
  "half",
  "libloading 0.9.0",
 ]
@@ -1424,12 +1421,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "env_home"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c7f84e12ccf0a7ddc17a6c41c93326024c42920d7ee630d04950e6926645c0fe"
-
-[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1589,14 +1580,24 @@ dependencies = [
 
 [[package]]
 name = "float8"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "719a903cc23e4a89e87962c2a80fdb45cdaad0983a89bd150bb57b4c8571a7d5"
+dependencies = [
+ "cudarc 0.19.3",
+ "half",
+ "num-traits",
+ "rand 0.9.2",
+ "rand_distr",
+]
+
+[[package]]
+name = "float8"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2d1f04709a8ac06e8e8042875a3c466cc4832d3c1a18dbcb9dba3c6e83046bc"
 dependencies = [
  "half",
- "num-traits",
- "rand 0.9.2",
- "rand_distr",
 ]
 
 [[package]]
@@ -1666,16 +1667,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
-]
-
-[[package]]
-name = "fs2"
-version = "0.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9564fc758e15025b46aa6643b1b77d047d1a56a1aea6e01002ac0c7026876213"
-dependencies = [
- "libc",
- "winapi",
 ]
 
 [[package]]
@@ -4475,18 +4466,21 @@ dependencies = [
 
 [[package]]
 name = "qwen3-asr"
-version = "0.1.0"
-source = "git+https://github.com/alan890104/qwen3-asr-rs.git?rev=b505643#b50564321db6e731fde175045146b1fd59db7116"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0363e8e7f2a241853da09705f66e0f4ff636cf4138bbf83b386e05daabb9804e"
 dependencies = [
  "anyhow",
  "candle-core",
  "candle-nn",
  "hound",
+ "log",
  "rubato",
  "rustfft",
  "safetensors 0.4.5",
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
  "tokenizers",
 ]
 
@@ -5556,6 +5550,7 @@ dependencies = [
  "tauri-plugin-process",
  "tauri-plugin-single-instance",
  "tauri-plugin-updater",
+ "tempfile",
  "tokenizers",
  "tracing",
  "tracing-appender",
@@ -7086,18 +7081,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a28ac98ddc8b9274cb41bb4d9d4d5c425b6020c50c46f25559911905610b4a88"
 
 [[package]]
-name = "which"
-version = "7.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "24d643ce3fd3e5b54854602a080f34fb10ab75e0b813ee32d00ca2b44fa74762"
-dependencies = [
- "either",
- "env_home",
- "rustix",
- "winsafe",
-]
-
-[[package]]
 name = "whisper-rs"
 version = "0.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7683,12 +7666,6 @@ dependencies = [
  "cfg-if",
  "windows-sys 0.59.0",
 ]
-
-[[package]]
-name = "winsafe"
-version = "0.0.19"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d135d17ab770252ad95e9a872d365cf3090e3be864a34ab46f48555993efc904"
 
 [[package]]
 name = "wit-bindgen"
