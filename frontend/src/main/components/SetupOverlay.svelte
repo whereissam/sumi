@@ -69,8 +69,10 @@
     | 'sttChoice'
     | 'downloading'
     | 'complete'
+    | 'activating'
     | 'polishChoice'
     | 'llmDownloading'
+    | 'llmActivating'
     | 'error';
 
   let currentState = $state<SetupState>('permissions');
@@ -124,6 +126,8 @@
 
   // ── STT Choice ──
 
+  let sttModelsLoading = $state(true);
+  let sttLocalActivating = $state(false);
   let sttMode = $state<string>('local');
   let sttModels = $state<WhisperModelInfo[]>([]);
   let selectedSttModel = $state<WhisperModelId>('large_v3_turbo');
@@ -193,6 +197,8 @@
       recommendedKey = engineRec === 'whisper' ? `whisper:${rec}` : `qwen3_asr:${q3rec}`;
     } catch {
       // Fallback to defaults
+    } finally {
+      sttModelsLoading = false;
     }
   }
 
@@ -290,50 +296,39 @@
 
   async function onSttLocalDownload() {
     setSttMode('local');
-
-    if (selectedLocalEngine === 'whisper') {
-      setSttLocalEngine('whisper');
-      setSttWhisperModel(selectedSttModel);
-      try {
-        await switchWhisperModel(selectedSttModel);
-      } catch (e) {
-        console.error('Failed to switch whisper model:', e);
+    sttLocalActivating = true;
+    try {
+      if (selectedLocalEngine === 'whisper') {
+        setSttLocalEngine('whisper');
+        setSttWhisperModel(selectedSttModel);
+      } else {
+        setSttLocalEngine('qwen3_asr');
+        setSttQwen3AsrModel(selectedQwen3Model);
       }
 
-      if (selectedSttModelDownloaded) {
+      // Persist settings before download/activation
+      try { await saveSettingsApi(buildPayload()); } catch {}
+
+      const modelDownloaded = selectedLocalEngine === 'whisper'
+        ? selectedSttModelDownloaded
+        : selectedQwen3ModelDownloaded;
+
+      if (modelDownloaded) {
         try {
           const vadStatus = await checkVadModelStatus();
           if (vadStatus.downloaded) {
-            try { await saveSettingsApi(buildPayload()); } catch {}
-            goToPolishChoice();
+            // Fire-and-forget: activateSttModel sets currentState='activating'
+            // synchronously on its first line, so the UI transitions immediately.
+            void activateSttModel();
             return;
           }
         } catch {}
       }
-    } else {
-      // Qwen3-ASR
-      setSttLocalEngine('qwen3_asr');
-      setSttQwen3AsrModel(selectedQwen3Model);
-      try {
-        await switchQwen3AsrModel(selectedQwen3Model);
-      } catch (e) {
-        console.error('Failed to switch Qwen3-ASR model:', e);
-      }
 
-      if (selectedQwen3ModelDownloaded) {
-        try {
-          const vadStatus = await checkVadModelStatus();
-          if (vadStatus.downloaded) {
-            try { await saveSettingsApi(buildPayload()); } catch {}
-            goToPolishChoice();
-            return;
-          }
-        } catch {}
-      }
+      startSttDownload();
+    } finally {
+      sttLocalActivating = false;
     }
-    // Persist local_engine (and model) before starting download
-    try { await saveSettingsApi(buildPayload()); } catch {}
-    startSttDownload();
   }
 
   // ── STT Download ──
@@ -353,9 +348,29 @@
     if (whisperDone && vadDone && currentState === 'downloading') {
       downloadPercent = 100;
       currentState = 'complete';
-      setTimeout(() => goToPolishChoice(), 1500);
+      setTimeout(() => activateSttModel(), 1500);
     }
   });
+
+  async function activateSttModel() {
+    currentState = 'activating';
+    try {
+      if (selectedLocalEngine === 'whisper') {
+        await switchWhisperModel(selectedSttModel);
+      } else {
+        await switchQwen3AsrModel(selectedQwen3Model);
+      }
+    } catch (e) {
+      if (currentState !== 'activating') return; // user clicked Skip
+      console.error('Failed to activate STT model:', e);
+      errorMessage = String(e);
+      lastFailedStep = 'sttActivate';
+      currentState = 'error';
+      return;
+    }
+    if (currentState !== 'activating') return; // user clicked Skip
+    goToPolishChoice();
+  }
 
   async function startSttDownload() {
     currentState = 'downloading';
@@ -395,7 +410,7 @@
           whisperDone = true;
         } else if (p.status === 'error') {
           errorMessage = p.message || t('setup.errorDefault');
-          lastFailedDownload = 'stt';
+          lastFailedStep = 'sttDownload';
           currentState = 'error';
         }
       });
@@ -404,7 +419,7 @@
         await downloadWhisperModel(selectedSttModel);
       } catch (e) {
         errorMessage = String(e);
-        lastFailedDownload = 'stt';
+        lastFailedStep = 'sttDownload';
         currentState = 'error';
       }
     } else {
@@ -414,7 +429,7 @@
           whisperDone = true; // reuse flag — signals STT model is done
         } else if (p.status === 'error') {
           errorMessage = p.message || t('setup.errorDefault');
-          lastFailedDownload = 'stt';
+          lastFailedStep = 'sttDownload';
           currentState = 'error';
         } else {
           const total = p.total || 1;
@@ -430,7 +445,7 @@
         await downloadQwen3AsrModel(selectedQwen3Model);
       } catch (e) {
         errorMessage = String(e);
-        lastFailedDownload = 'stt';
+        lastFailedStep = 'sttDownload';
         currentState = 'error';
       }
     }
@@ -438,6 +453,8 @@
 
   // ── Polish Choice ──
 
+  let polishModelsLoading = $state(true);
+  // polishLocalActivating no longer needed — onPolishLocalDownload transitions immediately
   let polishMode = $state<string>('local');
   let polishModels = $state<PolishModelInfo[]>([]);
   let selectedPolishModel = $state<PolishModel>('phi4_mini');
@@ -458,6 +475,7 @@
   ];
 
   async function fetchPolishModels() {
+    polishModelsLoading = true;
     try {
       polishModels = await listPolishModels();
       // Pre-select first available model
@@ -466,6 +484,8 @@
       }
     } catch {
       polishModels = [];
+    } finally {
+      polishModelsLoading = false;
     }
   }
 
@@ -536,18 +556,11 @@
   }
 
   async function onPolishLocalDownload() {
-    // Switch to selected model in backend + settings store
     setPolishModel(selectedPolishModel);
-    try {
-      await switchPolishModel(selectedPolishModel);
-    } catch (e) {
-      console.error('Failed to switch polish model:', e);
-    }
 
     if (selectedModelDownloaded) {
-      setPolishMode('local');
-      setPolishEnabled(true);
-      finishSetup();
+      // Model already on disk — show activation spinner
+      void activatePolishModel();
     } else {
       startLlmDownload();
     }
@@ -585,10 +598,7 @@
         llmDownloadTotalBytes = total;
       } else if (p.status === 'complete') {
         llmDownloadPercent = 100;
-        // Set polish to local + enabled
-        setPolishMode('local');
-        setPolishEnabled(true);
-        finishSetup();
+        setTimeout(() => activatePolishModel(), 1500);
       } else if (p.status === 'error') {
         console.error('LLM setup download error:', p.message);
         // On error, advance -- user can download from settings later
@@ -604,16 +614,34 @@
     }
   }
 
+  async function activatePolishModel() {
+    currentState = 'llmActivating';
+    try {
+      await switchPolishModel(selectedPolishModel);
+    } catch (e) {
+      if (currentState !== 'llmActivating') return; // user clicked Skip
+      console.error('Failed to activate polish model:', e);
+      errorMessage = String(e);
+      lastFailedStep = 'llmActivate';
+      currentState = 'error';
+      return;
+    }
+    if (currentState !== 'llmActivating') return; // user clicked Skip
+    setPolishMode('local');
+    setPolishEnabled(true);
+    finishSetup();
+  }
+
   // ── Error state ──
 
   let errorMessage = $state('');
-  let lastFailedDownload = $state<'stt' | 'llm'>('stt');
+  let lastFailedStep = $state<'sttDownload' | 'sttActivate' | 'llmActivate'>('sttDownload');
 
   function onRetryDownload() {
-    if (lastFailedDownload === 'stt') {
-      startSttDownload();
-    } else {
-      startLlmDownload();
+    switch (lastFailedStep) {
+      case 'sttDownload': startSttDownload(); break;
+      case 'sttActivate': activateSttModel(); break;
+      case 'llmActivate': void activatePolishModel(); break;
     }
   }
 
@@ -675,7 +703,7 @@
 
 {#if getShowSetup()}
   <div class="setup-overlay" class:fade-out={fadeOut}>
-    <div class="setup-backdrop"></div>
+    <div class="setup-backdrop" data-tauri-drag-region></div>
     <div class="setup-card">
 
       <!-- ═══ Permissions ═══ -->
@@ -797,8 +825,16 @@
                   class:selected={selectedLocalEngine === 'whisper' && selectedSttModel === model.id}
                   onclick={() => { selectedLocalEngine = 'whisper'; selectedSttModel = model.id; }}
                 >
-                  <div class="setup-model-radio">
-                    {#if selectedLocalEngine === 'whisper' && selectedSttModel === model.id}
+                  <div class="setup-model-radio" class:downloaded={model.downloaded}>
+                    {#if model.downloaded && selectedLocalEngine === 'whisper' && selectedSttModel === model.id}
+                      <svg width="10" height="10" viewBox="0 0 10 10" fill="none">
+                        <path d="M1.5 5.5L4 8L8.5 2.5" stroke="white" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                      </svg>
+                    {:else if model.downloaded}
+                      <svg width="10" height="10" viewBox="0 0 10 10" fill="none">
+                        <path d="M1.5 5.5L4 8L8.5 2.5" stroke="rgba(255,255,255,0.45)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                      </svg>
+                    {:else if selectedLocalEngine === 'whisper' && selectedSttModel === model.id}
                       <div class="setup-model-radio-dot"></div>
                     {/if}
                   </div>
@@ -821,8 +857,16 @@
                   class:selected={selectedLocalEngine === 'qwen3_asr' && selectedQwen3Model === model.id}
                   onclick={() => { selectedLocalEngine = 'qwen3_asr'; selectedQwen3Model = model.id; }}
                 >
-                  <div class="setup-model-radio">
-                    {#if selectedLocalEngine === 'qwen3_asr' && selectedQwen3Model === model.id}
+                  <div class="setup-model-radio" class:downloaded={model.downloaded}>
+                    {#if model.downloaded && selectedLocalEngine === 'qwen3_asr' && selectedQwen3Model === model.id}
+                      <svg width="10" height="10" viewBox="0 0 10 10" fill="none">
+                        <path d="M1.5 5.5L4 8L8.5 2.5" stroke="white" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                      </svg>
+                    {:else if model.downloaded}
+                      <svg width="10" height="10" viewBox="0 0 10 10" fill="none">
+                        <path d="M1.5 5.5L4 8L8.5 2.5" stroke="rgba(255,255,255,0.45)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                      </svg>
+                    {:else if selectedLocalEngine === 'qwen3_asr' && selectedQwen3Model === model.id}
                       <div class="setup-model-radio-dot"></div>
                     {/if}
                   </div>
@@ -841,8 +885,17 @@
               {/each}
             </div>
 
-            <button class="setup-download-btn" onclick={onSttLocalDownload}>
-              {isCurrentModelDownloaded ? t('setup.permContinue') : t('setup.sttModelDownloadBtn')}
+            <button class="setup-download-btn" disabled={sttModelsLoading || sttLocalActivating} onclick={onSttLocalDownload}>
+              {#if sttModelsLoading || sttLocalActivating}
+                <span class="setup-btn-spinner">
+                  <svg class="setup-spinner" width="14" height="14" viewBox="0 0 14 14" fill="none">
+                    <circle cx="7" cy="7" r="5" stroke="rgba(255,255,255,0.35)" stroke-width="2"/>
+                    <path d="M7 2a5 5 0 0 1 5 5" stroke="white" stroke-width="2" stroke-linecap="round"/>
+                  </svg>
+                </span>
+              {:else}
+                {isCurrentModelDownloaded ? t('setup.permContinue') : t('setup.sttModelDownloadBtn')}
+              {/if}
             </button>
           {:else}
             <div class="setup-panel-desc">{t('setup.sttCloudDesc')}</div>
@@ -914,6 +967,44 @@
         </div>
       {/if}
 
+      <!-- ═══ Activating STT Model ═══ -->
+      {#if currentState === 'activating'}
+        <div class="setup-state-content" style="animation: setupFadeIn 0.4s ease">
+          <div class="setup-mic-wrap">
+            <div class="wave"></div>
+            <div class="wave"></div>
+            <div class="wave"></div>
+            <svg class="setup-mic-icon pulsing" width="64" height="64" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <rect x="24" y="8" width="16" height="28" rx="8" fill="#007AFF"/>
+              <path d="M16 28v4a16 16 0 0 0 32 0v-4" stroke="#007AFF" stroke-width="3" fill="none" stroke-linecap="round"/>
+              <line x1="32" y1="48" x2="32" y2="56" stroke="#007AFF" stroke-width="3" stroke-linecap="round"/>
+            </svg>
+          </div>
+          <div class="setup-title">{t('setup.activatingTitle')}</div>
+          <div class="setup-desc">{t('setup.activatingDesc')}</div>
+          <button class="setup-skip-link" onclick={() => goToPolishChoice()}>{t('setup.llmSkip')}</button>
+        </div>
+      {/if}
+
+      <!-- ═══ Activating LLM Model ═══ -->
+      {#if currentState === 'llmActivating'}
+        <div class="setup-state-content" style="animation: setupFadeIn 0.4s ease">
+          <div class="setup-mic-wrap">
+            <div class="wave"></div>
+            <div class="wave"></div>
+            <div class="wave"></div>
+            <svg class="setup-mic-icon pulsing" width="64" height="64" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <path d="M32 12L35.5 28.5L52 32L35.5 35.5L32 52L28.5 35.5L12 32L28.5 28.5Z" fill="#007AFF"/>
+              <path d="M48 14L49.5 19.5L55 21L49.5 22.5L48 28L46.5 22.5L41 21L46.5 19.5Z" fill="#007AFF" opacity="0.7"/>
+              <path d="M50 42L51 46L55 47L51 48L50 52L49 48L45 47L49 46Z" fill="#007AFF" opacity="0.5"/>
+            </svg>
+          </div>
+          <div class="setup-title">{t('setup.llmActivatingTitle')}</div>
+          <div class="setup-desc">{t('setup.llmActivatingDesc')}</div>
+          <button class="setup-skip-link" onclick={() => { currentState = 'complete'; setPolishMode('local'); setPolishEnabled(true); finishSetup(); }}>{t('setup.llmSkip')}</button>
+        </div>
+      {/if}
+
       <!-- ═══ Polish Choice ═══ -->
       {#if currentState === 'polishChoice'}
         <div class="setup-state-content" style="animation: setupFadeIn 0.4s ease">
@@ -951,8 +1042,16 @@
                   class:selected={selectedPolishModel === model.id}
                   onclick={() => selectedPolishModel = model.id}
                 >
-                  <div class="setup-model-radio">
-                    {#if selectedPolishModel === model.id}
+                  <div class="setup-model-radio" class:downloaded={model.downloaded}>
+                    {#if model.downloaded && selectedPolishModel === model.id}
+                      <svg width="10" height="10" viewBox="0 0 10 10" fill="none">
+                        <path d="M1.5 5.5L4 8L8.5 2.5" stroke="white" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                      </svg>
+                    {:else if model.downloaded}
+                      <svg width="10" height="10" viewBox="0 0 10 10" fill="none">
+                        <path d="M1.5 5.5L4 8L8.5 2.5" stroke="rgba(255,255,255,0.45)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                      </svg>
+                    {:else if selectedPolishModel === model.id}
                       <div class="setup-model-radio-dot"></div>
                     {/if}
                   </div>
@@ -971,8 +1070,17 @@
               {/each}
             </div>
 
-            <button class="setup-download-btn" onclick={onPolishLocalDownload}>
-              {selectedModelDownloaded ? t('setup.permContinue') : t('setup.llmDownloadBtn')}
+            <button class="setup-download-btn" disabled={polishModelsLoading} onclick={onPolishLocalDownload}>
+              {#if polishModelsLoading}
+                <span class="setup-btn-spinner">
+                  <svg class="setup-spinner" width="14" height="14" viewBox="0 0 14 14" fill="none">
+                    <circle cx="7" cy="7" r="5" stroke="rgba(255,255,255,0.35)" stroke-width="2"/>
+                    <path d="M7 2a5 5 0 0 1 5 5" stroke="white" stroke-width="2" stroke-linecap="round"/>
+                  </svg>
+                </span>
+              {:else}
+                {selectedModelDownloaded ? t('setup.permContinue') : t('setup.llmDownloadBtn')}
+              {/if}
             </button>
           {:else}
             <div class="setup-panel-desc">{t('setup.polishCloudDesc')}</div>
@@ -1298,6 +1406,21 @@
     cursor: not-allowed;
   }
 
+  .setup-btn-spinner {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  @keyframes spin {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
+  }
+
+  .setup-spinner {
+    animation: spin 0.8s linear infinite;
+  }
+
   .setup-retry-btn {
     display: inline-block;
     padding: 10px 28px;
@@ -1459,6 +1582,11 @@
     height: 10px;
     border-radius: 50%;
     background: var(--accent-blue);
+  }
+
+  .setup-model-radio.downloaded {
+    border-color: #34C759;
+    background: #34C759;
   }
 
   .setup-model-info {

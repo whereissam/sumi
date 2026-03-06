@@ -42,12 +42,12 @@ let settings = $state<Settings>({
     local_engine: 'whisper',
     qwen3_asr_model: 'qwen3_asr1_7_b',
     language: 'auto',
-    vad_enabled: true,
   },
   edit_hotkey: null,
   onboarding_completed: false,
   mic_device: null,
   meeting_hotkey: null,
+  idle_mic_timeout_secs: 0,
 });
 
 export function getSettings(): Settings {
@@ -223,9 +223,6 @@ export function setSttQwen3AsrModel(model: Qwen3AsrModelId) {
   settings.stt.qwen3_asr_model = model;
 }
 
-export function setVadEnabled(v: boolean) {
-  settings.stt.vad_enabled = v;
-}
 
 export function setHistoryRetention(days: number) {
   settings.history_retention_days = days;
@@ -233,6 +230,10 @@ export function setHistoryRetention(days: number) {
 
 export function setAutoPaste(v: boolean) {
   settings.auto_paste = v;
+}
+
+export function setIdleMicTimeout(secs: number) {
+  settings.idle_mic_timeout_secs = secs;
 }
 
 // ── Prompt rules ──

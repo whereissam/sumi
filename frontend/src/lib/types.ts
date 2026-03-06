@@ -62,7 +62,6 @@ export interface SttConfig {
   local_engine: LocalSttEngine;
   qwen3_asr_model: Qwen3AsrModelId;
   language: string;
-  vad_enabled: boolean;
 }
 
 // ── Polish ──
@@ -149,6 +148,7 @@ export interface Settings {
   onboarding_completed: boolean;
   mic_device: string | null;
   meeting_hotkey: string | null;
+  idle_mic_timeout_secs: number;
 }
 
 // ── History ──
@@ -184,6 +184,9 @@ export interface HistoryStats {
   local_entries: number;
   local_duration_secs: number;
   total_words: number;
+  local_polish_entries: number;
+  local_polish_input_chars: number;
+  local_polish_output_chars: number;
 }
 
 // ── API responses ──
@@ -227,6 +230,7 @@ export interface DownloadProgress {
   downloaded?: number;
   total?: number;
   message?: string;
+  current_file?: string;
 }
 
 // ── Meeting Notes ──

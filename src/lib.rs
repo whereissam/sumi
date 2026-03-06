@@ -133,6 +133,9 @@ pub struct AppState {
     /// user's music resumes automatically.  Guards against spuriously resuming
     /// music that was already paused before recording started.
     pub media_paused_by_sumi: AtomicBool,
+    /// Timestamp of the last recording end. Used by the idle mic watcher to
+    /// determine when to close the mic stream.
+    pub last_recording_end: Mutex<Option<Instant>>,
 }
 
 /// Emit a `"transcription-partial"` event to the overlay window.
@@ -258,6 +261,9 @@ fn stop_transcribe_and_paste(app: &AppHandle) {
             &stt_language,
             &dictionary_terms,
         );
+        if let Ok(mut t) = state.last_recording_end.lock() {
+            *t = Some(Instant::now());
+        }
         // Resume media paused at recording start.
         if state.media_paused_by_sumi.swap(false, Ordering::SeqCst) {
             platform::resume_now_playing();
@@ -561,6 +567,9 @@ fn stop_edit_and_replace(app: &AppHandle) {
             &edit_stt_language,
             &edit_dict_terms,
         );
+        if let Ok(mut t) = state.last_recording_end.lock() {
+            *t = Some(Instant::now());
+        }
         // Resume media paused at recording start.
         if state.media_paused_by_sumi.swap(false, Ordering::SeqCst) {
             platform::resume_now_playing();
@@ -991,6 +1000,7 @@ pub fn run() {
                     settings.meeting_hotkey.as_deref().and_then(parse_hotkey_string),
                 ),
                 media_paused_by_sumi: AtomicBool::new(false),
+                last_recording_end: Mutex::new(None),
             });
 
             // Register a CoreAudio listener for default-input-device changes.
@@ -1065,7 +1075,14 @@ pub fn run() {
                         // Always reset the guard so future events can trigger reconnect.
                         state.reconnecting.store(false, Ordering::SeqCst);
                         match result {
-                            Ok(()) => tracing::info!("Mic stream reconnected after input device change"),
+                            Ok(()) => {
+                                tracing::info!("Mic stream reconnected after input device change");
+                                // Reset idle clock so the watcher doesn't immediately
+                                // close the freshly reconnected stream.
+                                if let Ok(mut t) = state.last_recording_end.lock() {
+                                    *t = None;
+                                }
+                            }
                             Err(e) => tracing::error!("Mic stream reconnect failed: {}", e),
                         }
                     });
@@ -1182,6 +1199,96 @@ pub fn run() {
                         Ok(Ok(())) => tracing::info!("Mic stream pre-opened at startup"),
                         Ok(Err(e)) => tracing::warn!("Mic pre-open failed (will retry on first hotkey): {}", e),
                         Err(_) => tracing::error!("Mic pre-open thread panicked; reconnecting flag reset"),
+                    }
+                });
+            }
+
+            // Idle mic watcher: closes the mic stream after a configurable idle
+            // period to avoid CoreAudio DSP (echo cancellation, AGC, audio
+            // ducking) from affecting other apps when Sumi is not in use.
+            {
+                let app_handle = app.handle().clone();
+                std::thread::spawn(move || {
+                    tracing::info!("Idle mic watcher started (poll interval: 5s)");
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_secs(5));
+                        let state = app_handle.state::<AppState>();
+
+                        let timeout_secs = state
+                            .settings
+                            .lock()
+                            .map(|s| s.idle_mic_timeout_secs)
+                            .unwrap_or(0);
+                        if timeout_secs == 0 {
+                            continue;
+                        }
+
+                        // Don't close while recording, meeting, or reconnecting.
+                        if state.is_recording.load(Ordering::SeqCst)
+                            || state.meeting_active.load(Ordering::SeqCst)
+                            || state.reconnecting.load(Ordering::SeqCst)
+                            || !state.mic_available.load(Ordering::SeqCst)
+                        {
+                            continue;
+                        }
+
+                        let timeout = std::time::Duration::from_secs(timeout_secs as u64);
+
+                        // Pre-check elapsed outside the lock as a fast path to
+                        // avoid contending on audio_thread every 5 seconds.
+                        let elapsed = state
+                            .last_recording_end
+                            .lock()
+                            .ok()
+                            .and_then(|t| t.map(|i| i.elapsed()));
+
+                        match elapsed {
+                            None | Some(std::time::Duration::ZERO) => continue, // never recorded
+                            Some(e) if e < timeout => continue,
+                            _ => {}
+                        }
+
+                        // Acquire audio_thread lock and re-check all guards
+                        // atomically — do_start_recording Step 3 also holds
+                        // this lock when setting is_recording=true, so the two
+                        // operations are mutually exclusive (no TOCTOU window).
+                        if let Ok(mut at) = state.audio_thread.lock() {
+                            if state.is_recording.load(Ordering::SeqCst)
+                                || state.meeting_active.load(Ordering::SeqCst)
+                                || state.reconnecting.load(Ordering::SeqCst)
+                            {
+                                continue;
+                            }
+                            // Re-read elapsed inside the lock to close the
+                            // TOCTOU window: a recording may have completed
+                            // between our pre-check and acquiring this lock.
+                            let fresh = state
+                                .last_recording_end
+                                .lock()
+                                .ok()
+                                .and_then(|t| t.map(|i| i.elapsed()));
+                            match fresh {
+                                None | Some(std::time::Duration::ZERO) => continue,
+                                Some(e) if e < timeout => continue,
+                                _ => {}
+                            }
+                            tracing::info!(
+                                "Idle mic timeout ({}s) — closing mic stream",
+                                timeout_secs
+                            );
+                            // Set mic_available=false BEFORE stopping the
+                            // stream so a concurrent do_start_recording
+                            // sees the unavailable flag immediately.
+                            state.mic_available.store(false, Ordering::SeqCst);
+                            if let Some(ctrl) = at.take() {
+                                ctrl.stop();
+                            }
+                            // Reset idle clock so a hot-plug reconnect
+                            // doesn't immediately re-trigger a close.
+                            if let Ok(mut t) = state.last_recording_end.lock() {
+                                *t = None;
+                            }
+                        };
                     }
                 });
             }
@@ -1774,6 +1881,7 @@ fn start_meeting_mode(app: &AppHandle) {
         }
         return;
     }
+    tracing::info!("🎙️ Meeting mode started (engine: {:?}, lang: {:?})", stt_mode, lang);
     // Advance the session generation counter. The feeder captures this value
     // and aborts post-loop work if the counter has advanced past it, preventing
     // a zombie feeder from a timed-out previous session from corrupting state.
@@ -1929,7 +2037,8 @@ fn stop_meeting_mode(app: &AppHandle) {
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
     {
-        return; // Another stop_meeting_mode call is already in progress.
+        tracing::warn!("stop_meeting_mode: already in progress, skipping re-entrant call");
+        return;
     }
 
     // Capture session_id at entry. If a new meeting starts between the timeout
@@ -1940,6 +2049,9 @@ fn stop_meeting_mode(app: &AppHandle) {
     // Ensure the feeder sees is_recording=false (it may already be false if
     // triggered by dead-stream, which is fine — the store is idempotent).
     state.is_recording.store(false, Ordering::SeqCst);
+    if let Ok(mut t) = state.last_recording_end.lock() {
+        *t = Some(Instant::now());
+    }
     // Wake the meeting feeder immediately so it exits its 2 s sleep and starts
     // post-loop work (trailing feed + finish_streaming) right away.
     state.feeder_stop_cv.notify_all();
@@ -2030,6 +2142,11 @@ fn stop_meeting_mode(app: &AppHandle) {
         return;
     }
 
+    let word_count = history::count_words(&transcript);
+    tracing::info!(
+        "Meeting mode stopped ({:.0}s, {} words)",
+        duration_secs, word_count
+    );
     if let Some(overlay) = app.get_webview_window("overlay") {
         let _ = overlay.emit("recording-status", "meeting_stopped");
     }
