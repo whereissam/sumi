@@ -148,15 +148,28 @@ pub(crate) fn emit_transcription_partial(app: &AppHandle, text: &str) {
     }
 }
 
-/// Position the overlay window centered horizontally, near the bottom of the screen.
+/// Position the overlay window centered horizontally near the bottom of the focused screen.
+///
+/// Uses `NSScreen.mainScreen` (the screen with the active keyboard focus) so the
+/// capsule always appears on the same screen as the user's frontmost app.
+/// Falls back to the overlay's current monitor if the platform call is unavailable.
 fn center_overlay_bottom(overlay: &tauri::WebviewWindow) {
-    if let Ok(Some(monitor)) = overlay.current_monitor() {
+    const WIN_W: f64 = 300.0;
+    const WIN_H: f64 = 40.0;
+    const MARGIN_BOTTOM: f64 = 80.0;
+
+    if let Some((sx, sy, sw, sh, scale)) = platform::focused_screen_logical_frame() {
+        let x = sx + (sw - WIN_W) / 2.0;
+        let y = sy + sh - WIN_H - MARGIN_BOTTOM;
+        let _ = overlay.set_position(tauri::PhysicalPosition::new(
+            (x * scale) as i32,
+            (y * scale) as i32,
+        ));
+    } else if let Ok(Some(monitor)) = overlay.current_monitor() {
         let screen = monitor.size();
         let scale = monitor.scale_factor();
-        let win_w = 300.0;
-        let win_h = 40.0;
-        let x = (screen.width as f64 / scale - win_w) / 2.0;
-        let y = screen.height as f64 / scale - win_h - 80.0;
+        let x = (screen.width as f64 / scale - WIN_W) / 2.0;
+        let y = screen.height as f64 / scale - WIN_H - MARGIN_BOTTOM;
         let _ = overlay.set_position(tauri::PhysicalPosition::new(
             (x * scale) as i32,
             (y * scale) as i32,
@@ -1176,7 +1189,7 @@ pub fn run() {
                 })
                 .build(app)?;
 
-            // Window close → hide; enable drag-by-background for overlay title bar
+            // Window close → hide; enable drag (CSS -webkit-app-region controls where)
             if let Some(main_window) = app.get_webview_window("main") {
                 platform::set_main_window_movable(&main_window);
                 let win = main_window.clone();

@@ -38,21 +38,228 @@ pub unsafe fn set_accessory_policy() {
     send_policy(ns_app, sel_policy, 1); // 1 = Accessory
 }
 
-/// Enable dragging the main window by its background.
+// ── Title-bar drag view ─────────────────────────────────────────────
+
+/// Height (pt) of the draggable title-bar strip.
+const TITLE_BAR_HEIGHT: f64 = 28.0;
+
+extern "C" {
+    fn class_addMethod(
+        cls: *mut c_void,
+        name: *mut c_void,
+        imp: *const c_void,
+        types: *const c_char,
+    ) -> u8;
+}
+
+#[cfg(target_arch = "x86_64")]
+extern "C" {
+    fn objc_msgSend_stret();
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CGRect {
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+}
+
+/// Read an NSScreen's `frame` (CGRect) portably across ARM64 / x86-64.
+unsafe fn get_screen_frame(screen: *mut c_void) -> CGRect {
+    let sel = sel_registerName(c"frame".as_ptr());
+    #[cfg(target_arch = "aarch64")]
+    {
+        let f: unsafe extern "C" fn(*mut c_void, *mut c_void) -> CGRect =
+            std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+        f(screen, sel)
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        let f: unsafe extern "C" fn(*mut CGRect, *mut c_void, *mut c_void) =
+            std::mem::transmute(objc_msgSend_stret as unsafe extern "C" fn());
+        let mut r = CGRect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 };
+        f(&mut r, screen, sel);
+        r
+    }
+}
+
+/// Read an NSScreen's `backingScaleFactor`.
+unsafe fn get_screen_scale(screen: *mut c_void) -> f64 {
+    let sel = sel_registerName(c"backingScaleFactor".as_ptr());
+    let f: unsafe extern "C" fn(*mut c_void, *mut c_void) -> f64 =
+        std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+    f(screen, sel)
+}
+
+/// Returns `(tauri_x, tauri_y, width, height, scale)` of `NSScreen.mainScreen`
+/// (the screen that currently has keyboard focus) in Tauri logical coordinates
+/// (y=0 at top of primary screen, y increases downward).
 ///
-/// With `titleBarStyle: "Overlay"` + `resizable: true`, macOS no longer
-/// provides a native title-bar drag region because the web content covers
-/// the full window.  Setting `isMovableByWindowBackground = YES` lets the
-/// user drag the window by clicking anywhere that is not an interactive
-/// control.
+/// Returns `None` if `NSScreen.mainScreen` or the primary screen is unavailable.
+pub fn focused_screen_logical_frame() -> Option<(f64, f64, f64, f64, f64)> {
+    unsafe {
+        let cls = objc_getClass(c"NSScreen".as_ptr());
+        if cls.is_null() {
+            return None;
+        }
+        type Send1 = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
+        let send: Send1 = std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+
+        // [NSScreen mainScreen] — the screen with the key window (keyboard focus)
+        let main_screen = send(cls, sel_registerName(c"mainScreen".as_ptr()));
+        if main_screen.is_null() {
+            return None;
+        }
+        let main_frame = get_screen_frame(main_screen);
+        let scale = get_screen_scale(main_screen);
+
+        // [NSScreen screens].firstObject — the primary screen (has menu bar)
+        // Its frame is always {0, 0, w, h}; we need its height to flip the Y axis.
+        let screens = send(cls, sel_registerName(c"screens".as_ptr()));
+        if screens.is_null() {
+            return None;
+        }
+        type Send2 = unsafe extern "C" fn(*mut c_void, *mut c_void, usize) -> *mut c_void;
+        let send2: Send2 = std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+        let primary = send2(screens, sel_registerName(c"objectAtIndex:".as_ptr()), 0);
+        if primary.is_null() {
+            return None;
+        }
+        let primary_h = get_screen_frame(primary).h;
+
+        // macOS: origin bottom-left of primary screen, Y increases upward.
+        // Tauri: origin top-left of primary screen, Y increases downward.
+        // tauri_y = primary_h - macos_y - screen_h
+        let tauri_x = main_frame.x;
+        let tauri_y = primary_h - main_frame.y - main_frame.h;
+        Some((tauri_x, tauri_y, main_frame.w, main_frame.h, scale))
+    }
+}
+
+/// Read an NSView's `bounds` (CGRect) portably across ARM64 / x86-64.
+unsafe fn view_bounds(view: *mut c_void) -> CGRect {
+    let sel = sel_registerName(c"bounds".as_ptr());
+    #[cfg(target_arch = "aarch64")]
+    {
+        let f: unsafe extern "C" fn(*mut c_void, *mut c_void) -> CGRect =
+            std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+        f(view, sel)
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        let f: unsafe extern "C" fn(*mut CGRect, *mut c_void, *mut c_void) =
+            std::mem::transmute(objc_msgSend_stret as unsafe extern "C" fn());
+        let mut r = CGRect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 };
+        f(&mut r, view, sel);
+        r
+    }
+}
+
+/// `mouseDown:` → `[window performWindowDragWithEvent:]`.
+unsafe extern "C" fn drag_view_mouse_down(
+    this: *mut c_void,
+    _sel: *mut c_void,
+    event: *mut c_void,
+) {
+    let send: unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
+        std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+    let window = send(this, sel_registerName(c"window".as_ptr()));
+    if window.is_null() || event.is_null() {
+        return;
+    }
+    let send2: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) =
+        std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+    send2(
+        window,
+        sel_registerName(c"performWindowDragWithEvent:".as_ptr()),
+        event,
+    );
+}
+
+/// Place a transparent 28 pt NSView at the top of the main window that
+/// intercepts mouse-down events and starts a window drag.
+///
+/// This replaces `setMovableByWindowBackground` (which makes the *entire*
+/// window draggable) with a precise title-bar-only drag region.
 ///
 /// # Safety
-/// `ns_window` must be a valid, non-null NSWindow pointer.
-pub unsafe fn set_movable_by_background(ns_window: *mut c_void) {
-    let sel = sel_registerName(c"setMovableByWindowBackground:".as_ptr());
-    let send: unsafe extern "C" fn(*mut c_void, *mut c_void, i8) =
+/// `ns_window` must be a valid NSWindow pointer. Call on the main thread.
+pub unsafe fn setup_title_bar_drag(ns_window: *mut c_void) {
+    let send: unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
         std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
-    send(ns_window, sel, 1); // YES
+
+    // ── Get content view ───────────────────────────────────────────
+    let content = send(ns_window, sel_registerName(c"contentView".as_ptr()));
+    if content.is_null() {
+        return;
+    }
+
+    // ── Create SumiDragView class (once) ───────────────────────────
+    let mut cls = objc_getClass(c"SumiDragView".as_ptr());
+    if cls.is_null() {
+        let ns_view = objc_getClass(c"NSView".as_ptr());
+        if ns_view.is_null() {
+            return;
+        }
+        cls = objc_allocateClassPair(ns_view, c"SumiDragView".as_ptr(), 0);
+        if cls.is_null() {
+            return;
+        }
+        // -mouseDown:  →  start window drag
+        class_addMethod(
+            cls,
+            sel_registerName(c"mouseDown:".as_ptr()),
+            drag_view_mouse_down as *const c_void,
+            c"v@:@".as_ptr(),
+        );
+        objc_registerClassPair(cls);
+    }
+
+    // ── Alloc + init ───────────────────────────────────────────────
+    let instance = send(
+        send(cls, sel_registerName(c"alloc".as_ptr())),
+        sel_registerName(c"init".as_ptr()),
+    );
+    if instance.is_null() {
+        return;
+    }
+
+    // ── Position: top TITLE_BAR_HEIGHT pt of content view ──────────
+    let bounds = view_bounds(content);
+    let frame = CGRect {
+        x: 0.0,
+        y: bounds.h - TITLE_BAR_HEIGHT, // macOS: y=0 is bottom
+        w: bounds.w,
+        h: TITLE_BAR_HEIGHT,
+    };
+    let set_frame: unsafe extern "C" fn(*mut c_void, *mut c_void, CGRect) =
+        std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+    set_frame(
+        instance,
+        sel_registerName(c"setFrame:".as_ptr()),
+        frame,
+    );
+
+    // ── Autoresizing: follow width + pin to top ────────────────────
+    // NSViewWidthSizable (2) | NSViewMinYMargin (8)
+    let set_mask: unsafe extern "C" fn(*mut c_void, *mut c_void, u64) =
+        std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+    set_mask(
+        instance,
+        sel_registerName(c"setAutoresizingMask:".as_ptr()),
+        2 | 8,
+    );
+
+    // ── Add on top of WKWebView ────────────────────────────────────
+    let add_sub: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) =
+        std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+    add_sub(
+        content,
+        sel_registerName(c"addSubview:".as_ptr()),
+        instance,
+    );
 }
 
 /// Collection behavior flags for the overlay window.

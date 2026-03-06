@@ -17,11 +17,15 @@ pub fn set_app_accessory_mode() {
     fallback::set_accessory_policy();
 }
 
-/// Make the main window draggable by its background (macOS overlay title bar fix).
+/// Add a native drag view to the top 28 px of the main window.
+///
+/// On macOS this places a transparent NSView that intercepts mouse-down
+/// and calls `performWindowDragWithEvent:`, giving a precise title-bar
+/// drag region without making the entire background draggable.
 pub fn set_main_window_movable(window: &tauri::WebviewWindow) {
     #[cfg(target_os = "macos")]
     if let Ok(ns_win) = window.ns_window() {
-        unsafe { macos::set_movable_by_background(ns_win); }
+        unsafe { macos::setup_title_bar_drag(ns_win); }
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -127,6 +131,16 @@ pub fn pause_now_playing() {
 pub fn resume_now_playing() {
     #[cfg(target_os = "macos")]
     macos::simulate_media_play_pause();
+}
+
+/// Returns `(tauri_x, tauri_y, width, height, scale)` of the screen that currently
+/// has keyboard focus, in Tauri logical coordinates (y=0 at top of primary screen).
+/// Returns `None` on non-macOS or if the system call fails.
+pub fn focused_screen_logical_frame() -> Option<(f64, f64, f64, f64, f64)> {
+    #[cfg(target_os = "macos")]
+    { macos::focused_screen_logical_frame() }
+    #[cfg(not(target_os = "macos"))]
+    { None }
 }
 
 /// Returns the clipboard change sequence number if the platform supports it.
