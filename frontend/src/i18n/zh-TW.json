@@ -13,6 +13,7 @@
   "settings.shortcuts.hotkey": "語音輸入",
   "settings.shortcuts.hotkeyDesc": "按下以開始/停止錄音並轉錄",
   "settings.shortcuts.change": "更改",
+  "settings.shortcuts.reset": "重設",
   "settings.shortcuts.captureLabel": "請按下新的快捷鍵...",
   "settings.shortcuts.captureHint": "請使用至少一個修飾鍵（{modifiers}）加上一個按鍵",
   "settings.shortcuts.cancel": "取消",

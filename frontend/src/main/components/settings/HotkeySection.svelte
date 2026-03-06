@@ -5,7 +5,7 @@
   import { getHotkey, getEditHotkey, setHotkey, setEditHotkey, getPolishConfig, getMeetingHotkey, setMeetingHotkey } from '$lib/stores/settings.svelte';
   import { updateHotkey, updateEditHotkey, updateMeetingHotkey } from '$lib/api';
   import Keycaps from '$lib/components/Keycaps.svelte';
-  import { MODIFIER_SYMBOLS } from '$lib/constants';
+  import { MODIFIER_SYMBOLS, DEFAULT_HOTKEY, DEFAULT_EDIT_HOTKEY, DEFAULT_MEETING_HOTKEY } from '$lib/constants';
 
   const modifierHint = Object.values(MODIFIER_SYMBOLS).join(' ');
 
@@ -282,6 +282,35 @@
     return parts.join('+');
   });
 
+  // ── Reset to default ──
+
+  async function resetHotkey() {
+    try {
+      await updateHotkey(DEFAULT_HOTKEY);
+      setHotkey(DEFAULT_HOTKEY);
+    } catch (e) {
+      console.error('Failed to reset hotkey:', e);
+    }
+  }
+
+  async function resetEditHotkey() {
+    try {
+      await updateEditHotkey(DEFAULT_EDIT_HOTKEY);
+      setEditHotkey(DEFAULT_EDIT_HOTKEY);
+    } catch (e) {
+      console.error('Failed to reset edit hotkey:', e);
+    }
+  }
+
+  async function resetMeetingHotkey() {
+    try {
+      await updateMeetingHotkey(DEFAULT_MEETING_HOTKEY);
+      setMeetingHotkey(DEFAULT_MEETING_HOTKEY);
+    } catch (e) {
+      console.error('Failed to reset meeting hotkey:', e);
+    }
+  }
+
   // Cleanup on destroy
   onDestroy(() => {
     if (isCapturing) cancelCapture();
@@ -309,7 +338,12 @@
   {#if !isCapturing}
     <div class="hotkey-row">
       <Keycaps hotkey={getHotkey()} />
-      <button class="hotkey-btn" onclick={startCapture}>{t('settings.shortcuts.change')}</button>
+      <div class="hotkey-row-actions">
+        {#if getHotkey() !== DEFAULT_HOTKEY}
+          <button class="hotkey-reset-btn" onclick={resetHotkey}>{t('settings.shortcuts.reset')}</button>
+        {/if}
+        <button class="hotkey-btn" onclick={startCapture}>{t('settings.shortcuts.change')}</button>
+      </div>
     </div>
   {:else}
     <div class="hotkey-capture active">
@@ -343,7 +377,12 @@
         {:else}
           <span class="not-set">{t('settings.shortcuts.notSet')}</span>
         {/if}
-        <button class="hotkey-btn" onclick={startEditCapture}>{t('settings.shortcuts.change')}</button>
+        <div class="hotkey-row-actions">
+          {#if getEditHotkey() !== DEFAULT_EDIT_HOTKEY}
+            <button class="hotkey-reset-btn" onclick={resetEditHotkey}>{t('settings.shortcuts.reset')}</button>
+          {/if}
+          <button class="hotkey-btn" onclick={startEditCapture}>{t('settings.shortcuts.change')}</button>
+        </div>
       </div>
     {:else}
       <div class="hotkey-capture active">
@@ -375,7 +414,12 @@
         {:else}
           <span class="not-set">{t('settings.shortcuts.meetingNotSet')}</span>
         {/if}
-        <button class="hotkey-btn" onclick={startMeetingCapture}>{t('settings.shortcuts.change')}</button>
+        <div class="hotkey-row-actions">
+          {#if getMeetingHotkey() !== DEFAULT_MEETING_HOTKEY}
+            <button class="hotkey-reset-btn" onclick={resetMeetingHotkey}>{t('settings.shortcuts.reset')}</button>
+          {/if}
+          <button class="hotkey-btn" onclick={startMeetingCapture}>{t('settings.shortcuts.change')}</button>
+        </div>
       </div>
       {#if meetingCaptureError}
         <div class="capture-error">{meetingCaptureError}</div>
@@ -410,8 +454,32 @@
     gap: 12px;
   }
 
-  .hotkey-btn {
+  .hotkey-row-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-shrink: 0;
+  }
 
+  .hotkey-reset-btn {
+    padding: 7px 12px;
+    border: none;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--text-tertiary);
+    font-family: 'Inter', sans-serif;
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.15s ease;
+    white-space: nowrap;
+  }
+
+  .hotkey-reset-btn:hover {
+    color: var(--accent-blue);
+  }
+
+  .hotkey-btn {
     padding: 7px 16px;
     border: 1px solid var(--border-subtle);
     border-radius: var(--radius-sm);

@@ -13,6 +13,7 @@
   "settings.shortcuts.hotkey": "Dictation",
   "settings.shortcuts.hotkeyDesc": "Press to start/stop recording and transcribe",
   "settings.shortcuts.change": "Change",
+  "settings.shortcuts.reset": "Reset",
   "settings.shortcuts.captureLabel": "Press your new shortcut...",
   "settings.shortcuts.captureHint": "Use at least one modifier ({modifiers}) + a key",
   "settings.shortcuts.cancel": "Cancel",
