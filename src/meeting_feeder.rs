@@ -211,6 +211,22 @@ fn run_meeting_segmenter(
         }
 
         if !state.is_recording.load(Ordering::SeqCst) {
+            // Final drain: pick up audio recorded between the last 2s tick and
+            // the stop signal.  Without this, up to ~2s of speech at the end
+            // of the recording is silently discarded.
+            let remaining_raw: Vec<f32> = {
+                let buf = state.buffer.lock().unwrap_or_else(|e| e.into_inner());
+                let tail = last_tail.min(buf.len());
+                buf[tail..].to_vec()
+            };
+            if !remaining_raw.is_empty() {
+                let remaining_16k = if sr != 16000 {
+                    crate::audio::resample(&remaining_raw, sr, 16000)
+                } else {
+                    remaining_raw
+                };
+                chunk_buf.extend_from_slice(&remaining_16k);
+            }
             break;
         }
 
