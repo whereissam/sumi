@@ -382,10 +382,11 @@ pub struct DiarizationEngine {
     segment_buffer: Vec<(f64, f64, Vec<f32>)>,
 }
 
-// SAFETY: ort::session::Session is Send+Sync in ort 2.x. EmbeddingExtractor wraps
-// an ORT session and contains no thread-local state. DiarizationEngine is only
-// ever accessed through a Mutex<Option<DiarizationEngine>>, which provides the
-// required serialisation.
+// SAFETY: pyannote_rs::EmbeddingExtractor (v0.3.4) is a single-field struct
+// wrapping ort::session::Session, which declares `unsafe impl Send for Session {}`
+// in ort 2.0.0-rc.10 (session/mod.rs:565). All other fields (SpeakerClusters,
+// Vec<…>) are Send. DiarizationEngine is accessed only through a
+// Mutex<Option<DiarizationEngine>>, which serialises all access.
 unsafe impl Send for DiarizationEngine {}
 
 impl DiarizationEngine {
@@ -612,6 +613,7 @@ pub fn f32_to_i16(samples: &[f32]) -> Vec<i16> {
 }
 
 fn cosine_dist(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len(), "cosine_dist: embedding dimension mismatch ({} vs {})", a.len(), b.len());
     let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
     let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
     let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();

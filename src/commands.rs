@@ -2576,7 +2576,10 @@ pub fn download_diarization_model(app: AppHandle, state: State<'_, AppState>) ->
     }
 
     if let Some(dir) = model_path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            state.downloading.store(false, Ordering::SeqCst);
+            return Err(e.to_string());
+        }
     }
 
     let tmp_path = model_path.with_extension("onnx.part");
@@ -2687,7 +2690,10 @@ pub fn download_segmentation_model(app: AppHandle, state: State<'_, AppState>) -
     }
 
     if let Some(dir) = model_path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            state.downloading.store(false, Ordering::SeqCst);
+            return Err(e.to_string());
+        }
     }
 
     let tmp_path = model_path.with_extension("onnx.part");
