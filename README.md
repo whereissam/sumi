@@ -23,6 +23,14 @@ Sumi is a macOS dictation app. Press a hotkey anywhere, speak, and the transcrip
 </tr>
 </table>
 
+## You might need this if…
+
+- You bounce between Slack, Gmail, and chat apps all day, and your dictation tool outputs the same flat text everywhere — you're still fixing tone and format yourself
+- You type too much and your wrists notice it, and you don't want another $12/month subscription to solve that
+- You work in VSCode, a terminal, or an AI CLI tool and don't want voice input that sounds like you're texting a friend
+- You don't want your audio going to anyone's cloud — you want something you can verify yourself, not just a vendor's privacy promise
+- You sit through long meetings and walk away with nothing written down, and want transcription that runs in the background without babysitting
+
 ## The per-app rule thing
 
 Most dictation apps transcribe and paste. Sumi does that too, but the text goes through an LLM rewrite first, and the prompt the LLM sees depends on what app has focus.
