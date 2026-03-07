@@ -10,7 +10,6 @@ use std::sync::atomic::Ordering;
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::meeting_notes;
-use crate::segment_spacing::SpacingState;
 use crate::settings;
 
 /// Decode an audio file to mono f32 samples.
@@ -291,7 +290,9 @@ fn run_import_inner(app: &AppHandle, file_path: &str) -> Result<String, String> 
                             } else {
                                 Some(prev_text)
                             },
+                            0.0, // audio_start_secs: word timestamps not needed for import
                         )
+                        .map(|(text, _words)| text)
                         .unwrap_or_default()
                     })
                 }
@@ -330,7 +331,6 @@ fn run_import_inner(app: &AppHandle, file_path: &str) -> Result<String, String> 
 
     // ── Step 6: Chunk and transcribe ──
     let chunk_size = 30 * 16_000; // 30 seconds per chunk
-    let mut spacing = SpacingState::new();
 
     for chunk_start in (0..total_samples).step_by(chunk_size) {
         if state.import_cancelled.load(Ordering::SeqCst) {
@@ -351,21 +351,10 @@ fn run_import_inner(app: &AppHandle, file_path: &str) -> Result<String, String> 
             crate::transcribe::filter_with_vad(&state.vad_ctx, chunk)
                 .unwrap_or_else(|_| chunk.to_vec());
 
-        // Read previous context from WAL
+        // Read previous context from WAL for STT prompt biasing.
         let prev_text = {
             let full = meeting_notes::read_wal(&history_dir, &note_id);
-            let trimmed = full.trim_end();
-            let cc = trimmed.chars().count();
-            if cc > 200 {
-                trimmed
-                    .char_indices()
-                    .nth(cc - 200)
-                    .map(|(i, _)| &trimmed[i..])
-                    .unwrap_or(trimmed)
-                    .to_string()
-            } else {
-                trimmed.to_string()
-            }
+            meeting_notes::wal_text_for_context(&full, 200)
         };
 
         let seg_text = if stt_samples.is_empty() {
@@ -374,20 +363,21 @@ fn run_import_inner(app: &AppHandle, file_path: &str) -> Result<String, String> 
             transcribe(&stt_samples, &prev_text)
         };
 
-        let is_last = chunk_end >= total_samples;
-        let delta = if is_last {
-            spacing.build_final_delta(&seg_text)
-        } else {
-            spacing.build_tick_delta(&seg_text)
-        };
-
-        if !delta.is_empty() {
-            meeting_notes::append_wal(&history_dir, &note_id, &delta);
+        if !seg_text.is_empty() {
+            let seg = meeting_notes::WalSegment {
+                speaker: String::new(),
+                start: chunk_start as f64 / 16_000.0,
+                end: chunk_end as f64 / 16_000.0,
+                text: seg_text.clone(),
+                words: vec![],
+            };
+            meeting_notes::append_wal(&history_dir, &note_id, &seg);
             let _ = app.emit(
                 "meeting-note-updated",
                 serde_json::json!({
                     "id": note_id,
-                    "delta": delta,
+                    "delta": seg_text,
+                    "speaker": "",
                     "duration_secs": duration_secs,
                 }),
             );

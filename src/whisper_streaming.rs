@@ -271,13 +271,15 @@ pub(crate) fn run_whisper_preview_loop(app: AppHandle, language: String, session
 
 /// Transcribe `samples` (16 kHz) from the already-loaded `WhisperContextCache`.
 /// Uses `initial_prompt` for previous-segment context biasing.
-/// Returns an empty string (never an error) if the context is not loaded.
+/// `audio_start_secs` is used to anchor DTW word timestamps to meeting time.
+/// Returns `(text, words)`. On error or missing context, returns `("", vec![])`.
 pub(crate) fn transcribe_meeting_chunk<'a>(
     ctx_guard: &std::sync::MutexGuard<'_, Option<crate::transcribe::WhisperContextCache>>,
     samples: &[f32],
     language: &'a str,
     initial_prompt: Option<&'a str>,
-) -> Result<String, String> {
+    audio_start_secs: f64,
+) -> Result<(String, Vec<crate::meeting_notes::WordTs>), String> {
     let c = ctx_guard.as_ref().ok_or("Whisper context not loaded")?;
     let mut wh_state = c
         .ctx
@@ -325,26 +327,45 @@ pub(crate) fn transcribe_meeting_chunk<'a>(
             }
         }
     }
-    Ok(text.trim().to_string())
+
+    let words = crate::transcribe::extract_dtw_words(&wh_state, audio_start_secs);
+    Ok((text.trim().to_string(), words))
 }
 
 /// Meeting-mode feeder for continuous long-form transcription with Whisper.
 ///
 /// Delegates to `meeting_feeder::run_meeting_feeder` with a Whisper transcription
-/// closure that uses `initial_prompt` context from the WAL file.
+/// closure that performs diarization + DTW word extraction per segment.
 pub(crate) fn run_whisper_meeting_feeder_loop(app: AppHandle, language: String, session_id: u64) {
+    use crate::meeting_notes::WalSegment;
+
     let app_for_closure = app.clone();
-    let transcribe: Box<dyn FnMut(&[f32], &str) -> String + Send + 'static> =
-        Box::new(move |samples, prev_text| {
+    let transcribe: Box<dyn FnMut(&[f32], f64, f64, &str) -> WalSegment + Send + 'static> =
+        Box::new(move |samples, start_secs, end_secs, prev_text| {
             let state = app_for_closure.state::<crate::AppState>();
+
+            // Speaker diarization (optional — skipped if engine not loaded).
+            let speaker = {
+                let mut ctx = state.diarization_ctx.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(ref mut engine) = *ctx {
+                    let samples_i16 = crate::diarization::f32_to_i16(samples);
+                    engine.process_segment(&samples_i16)
+                } else {
+                    String::new()
+                }
+            };
+
             let ctx_guard = state.whisper_ctx.lock().unwrap_or_else(|e| e.into_inner());
-            transcribe_meeting_chunk(
+            let (text, words) = transcribe_meeting_chunk(
                 &ctx_guard,
                 samples,
                 &language,
                 if prev_text.is_empty() { None } else { Some(prev_text) },
+                start_secs,
             )
-            .unwrap_or_default()
+            .unwrap_or_default();
+
+            WalSegment { speaker, start: start_secs, end: end_secs, text, words }
         });
     // Cap each segment at 120 s so the Final segment never exceeds ~12 s of
     // Whisper inference time, keeping stop_meeting_mode well within the 5-min timeout.

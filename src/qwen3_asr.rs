@@ -338,11 +338,26 @@ pub(crate) fn run_meeting_feeder_loop(app: tauri::AppHandle, language: String, s
     }
 
     let app_for_closure = app.clone();
-    let transcribe: Box<dyn FnMut(&[f32], &str) -> String + Send + 'static> =
-        Box::new(move |samples, _prev_text| {
+    let transcribe: Box<dyn FnMut(&[f32], f64, f64, &str) -> crate::meeting_notes::WalSegment + Send + 'static> =
+        Box::new(move |samples, start_secs, end_secs, _prev_text| {
+            use crate::meeting_notes::WalSegment;
             let state = app_for_closure.state::<crate::AppState>();
-            transcribe_with_cached_qwen3_asr(&state.qwen3_asr_ctx, samples, &model, &language)
-                .unwrap_or_default()
+
+            // Speaker diarization (optional — skipped if engine not loaded).
+            let speaker = {
+                let mut ctx = state.diarization_ctx.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(ref mut engine) = *ctx {
+                    let samples_i16 = crate::diarization::f32_to_i16(samples);
+                    engine.process_segment(&samples_i16)
+                } else {
+                    String::new()
+                }
+            };
+
+            let text = transcribe_with_cached_qwen3_asr(&state.qwen3_asr_ctx, samples, &model, &language)
+                .unwrap_or_default();
+
+            WalSegment { speaker, start: start_secs, end: end_secs, text, words: vec![] }
         });
     crate::meeting_feeder::run_meeting_feeder(
         app,

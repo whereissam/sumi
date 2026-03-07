@@ -2,6 +2,7 @@ mod audio;
 mod audio_devices;
 mod audio_import;
 mod commands;
+pub mod diarization;
 mod segment_spacing;
 mod context_detect;
 mod credentials;
@@ -141,6 +142,9 @@ pub struct AppState {
     pub import_active: AtomicBool,
     /// Set to true to cancel a running audio file import.
     pub import_cancelled: AtomicBool,
+    /// Optional speaker diarization engine (WeSpeaker ONNX).
+    /// Loaded lazily at first meeting start when `settings.meeting_diarization_enabled`.
+    pub diarization_ctx: Mutex<Option<diarization::DiarizationEngine>>,
 }
 
 /// Emit a `"transcription-partial"` event to the overlay window.
@@ -857,6 +861,9 @@ pub fn run() {
             commands::delete_polish_model,
             commands::delete_qwen3_asr_model,
             commands::delete_vad_model,
+            commands::check_diarization_model_status,
+            commands::download_diarization_model,
+            commands::delete_diarization_model,
             commands::update_meeting_hotkey,
             commands::list_meeting_notes,
             commands::get_meeting_note,
@@ -1011,6 +1018,7 @@ pub fn run() {
                 last_recording_end: Mutex::new(None),
                 import_active: AtomicBool::new(false),
                 import_cancelled: AtomicBool::new(false),
+                diarization_ctx: Mutex::new(None),
             });
 
             // Register a CoreAudio listener for default-input-device changes.
@@ -1844,6 +1852,33 @@ fn start_meeting_mode(app: &AppHandle) {
     state.meeting_cancelled.store(false, Ordering::SeqCst);
     state.meeting_stopping.store(false, Ordering::SeqCst);
     state.meeting_feeder_done.store(false, Ordering::SeqCst);
+
+    // Load or reset the speaker diarization engine for the new session.
+    let diarization_enabled = state.settings.lock()
+        .map(|s| s.meeting_diarization_enabled)
+        .unwrap_or(false);
+    {
+        let mut diar = state.diarization_ctx.lock().unwrap_or_else(|e| e.into_inner());
+        if diarization_enabled {
+            let model_path = settings::diarization_model_path();
+            if model_path.exists() {
+                match diar.as_mut() {
+                    Some(engine) => engine.reset(),
+                    None => {
+                        match diarization::DiarizationEngine::new(&model_path) {
+                            Ok(engine) => *diar = Some(engine),
+                            Err(e) => tracing::warn!("[diarization] failed to load model: {e}"),
+                        }
+                    }
+                }
+            } else {
+                tracing::warn!("[diarization] model not found at {} — diarization disabled", model_path.display());
+            }
+        } else {
+            // Diarization disabled — clear any loaded engine to free memory.
+            *diar = None;
+        }
+    }
 
     let preferred_device = state.settings.lock().ok().and_then(|s| s.mic_device.clone());
 

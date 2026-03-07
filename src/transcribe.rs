@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Instant;
-use whisper_rs::{WhisperContext, WhisperContextParameters, WhisperVadContext, WhisperVadContextParams, WhisperVadParams};
+use whisper_rs::{DtwMode, DtwModelPreset, DtwParameters, WhisperContext, WhisperContextParameters, WhisperVadContext, WhisperVadContextParams, WhisperVadParams};
 
 use crate::settings::models_dir;
 use crate::whisper_models::WhisperModel;
@@ -210,6 +210,10 @@ pub fn warm_whisper_cache(
 
     let mut ctx_params = WhisperContextParameters::new();
     ctx_params.use_gpu(true);
+    ctx_params.dtw_parameters(DtwParameters {
+        mode: dtw_mode_for(model),
+        dtw_mem_size: 1024 * 1024 * 128,
+    });
     let ctx = WhisperContext::new_with_params(
         model_path.to_str().ok_or("Invalid model path")?,
         ctx_params,
@@ -261,6 +265,10 @@ pub fn transcribe_with_cached_whisper(
         );
         let mut ctx_params = WhisperContextParameters::new();
         ctx_params.use_gpu(true);
+        ctx_params.dtw_parameters(DtwParameters {
+            mode: dtw_mode_for(model),
+            dtw_mem_size: 1024 * 1024 * 128,
+        });
         let ctx = WhisperContext::new_with_params(
             model_path.to_str().ok_or("Invalid model path")?,
             ctx_params,
@@ -414,4 +422,98 @@ pub fn num_cpus() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)
+}
+
+/// Map a WhisperModel to its DTW cross-attention preset.
+/// Fine-tuned variants of LargeV3Turbo share the same architecture and use the same preset.
+fn dtw_mode_for(model: &WhisperModel) -> DtwMode<'static> {
+    match model {
+        WhisperModel::LargeV3Turbo
+        | WhisperModel::LargeV3TurboQ5
+        | WhisperModel::LargeV3TurboZhTw => DtwMode::ModelPreset {
+            model_preset: DtwModelPreset::LargeV3Turbo,
+        },
+        WhisperModel::Medium => DtwMode::ModelPreset {
+            model_preset: DtwModelPreset::Medium,
+        },
+        WhisperModel::Small => DtwMode::ModelPreset {
+            model_preset: DtwModelPreset::Small,
+        },
+        WhisperModel::Base => DtwMode::ModelPreset {
+            model_preset: DtwModelPreset::Base,
+        },
+    }
+}
+
+/// Extract word-level timestamps from DTW token alignment after Whisper inference.
+///
+/// `audio_start_secs` is the start time of this audio chunk relative to the meeting start.
+/// Tokens are merged at word boundaries (space-prefix convention used by Whisper).
+/// Special tokens (`t_dtw == -1`) are skipped.
+pub fn extract_dtw_words(
+    wh_state: &whisper_rs::WhisperState,
+    audio_start_secs: f64,
+) -> Vec<crate::meeting_notes::WordTs> {
+    use crate::meeting_notes::WordTs;
+
+    let mut words = Vec::new();
+    let num_segments = wh_state.full_n_segments();
+
+    for seg_idx in 0..num_segments {
+        let Some(seg) = wh_state.get_segment(seg_idx) else {
+            continue;
+        };
+
+        let n_tokens = seg.n_tokens();
+        let mut word_text = String::new();
+        let mut word_start_cs: i64 = -1; // centiseconds from audio start
+        let mut word_end_cs: i64 = -1;
+
+        for tok_idx in 0..n_tokens {
+            let Some(token) = seg.get_token(tok_idx) else {
+                continue;
+            };
+            let td = token.token_data();
+            if td.t_dtw < 0 {
+                continue; // special token (BOS/EOS/SOT/…)
+            }
+
+            let tok_str = match token.to_str_lossy() {
+                Ok(s) => s.into_owned(),
+                Err(_) => continue,
+            };
+
+            // Whisper encodes word boundaries with a leading space.
+            // When a new word starts, flush the accumulated previous word.
+            if tok_str.starts_with(' ') && !word_text.is_empty() {
+                if word_start_cs >= 0 {
+                    words.push(WordTs {
+                        w: word_text.trim().to_string(),
+                        s: audio_start_secs + word_start_cs as f64 / 100.0,
+                        e: audio_start_secs + word_end_cs as f64 / 100.0,
+                    });
+                }
+                word_text = tok_str;
+                word_start_cs = td.t_dtw;
+                word_end_cs = td.t_dtw;
+            } else {
+                if word_start_cs < 0 {
+                    word_start_cs = td.t_dtw;
+                }
+                word_text.push_str(&tok_str);
+                word_end_cs = td.t_dtw;
+            }
+        }
+
+        // Flush the final word of this segment.
+        if !word_text.is_empty() && word_start_cs >= 0 {
+            words.push(WordTs {
+                w: word_text.trim().to_string(),
+                s: audio_start_secs + word_start_cs as f64 / 100.0,
+                e: audio_start_secs + word_end_cs as f64 / 100.0,
+            });
+        }
+    }
+
+    words
 }

@@ -550,17 +550,32 @@ pub(crate) fn run_cloud_meeting_feeder_loop(
     cloud_config.language = language;
 
     let app_for_closure = app.clone();
-    let transcribe: Box<dyn FnMut(&[f32], &str) -> String + Send + 'static> =
-        Box::new(move |samples, prev_text| {
+    let transcribe: Box<dyn FnMut(&[f32], f64, f64, &str) -> crate::meeting_notes::WalSegment + Send + 'static> =
+        Box::new(move |samples, start_secs, end_secs, prev_text| {
+            use crate::meeting_notes::WalSegment;
             let state = app_for_closure.state::<crate::AppState>();
+
+            // Speaker diarization (optional — skipped if engine not loaded).
+            let speaker = {
+                let mut ctx = state.diarization_ctx.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(ref mut engine) = *ctx {
+                    let samples_i16 = crate::diarization::f32_to_i16(samples);
+                    engine.process_segment(&samples_i16)
+                } else {
+                    String::new()
+                }
+            };
+
             let prompt = if prev_text.is_empty() { None } else { Some(prev_text) };
-            match run_cloud_stt(&cloud_config, samples, &state.http_client, prompt) {
+            let text = match run_cloud_stt(&cloud_config, samples, &state.http_client, prompt) {
                 Ok(t) => t,
                 Err(e) => {
                     tracing::warn!("[cloud-meeting] transcription failed, skipping: {e}");
                     String::new()
                 }
-            }
+            };
+
+            WalSegment { speaker, start: start_secs, end: end_secs, text, words: vec![] }
         });
     // Cap each segment at 120 s to bound per-segment cloud STT cost and keep
     // stop_meeting_mode well within the 5-min timeout even on slow networks.

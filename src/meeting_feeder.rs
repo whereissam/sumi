@@ -25,49 +25,35 @@ use std::time::Duration;
 
 use tauri::{AppHandle, Emitter, Manager};
 
-use crate::segment_spacing::SpacingState;
-
 /// Segment types passed from segmenter to worker.
 enum Segment {
-    Tick(Vec<f32>),
-    Final(Vec<f32>),
+    Tick { samples: Vec<f32>, start_secs: f64, end_secs: f64 },
+    Final { samples: Vec<f32>, start_secs: f64, end_secs: f64 },
 }
 
-/// Read the last ~200 characters from the WAL file for use as a context prompt.
+/// Read the last ~200 plain-text characters from the WAL file for STT context biasing.
 fn read_wal_context(history_dir: &std::path::Path, note_id: &Option<String>) -> String {
     if let Some(ref id) = note_id {
         let full = crate::meeting_notes::read_wal(history_dir, id);
-        let trimmed = full.trim_end();
-        // Use char-aware slicing to avoid panics on multi-byte UTF-8 (Chinese, etc.)
-        let char_count = trimmed.chars().count();
-        if char_count > 200 {
-            trimmed
-                .char_indices()
-                .nth(char_count - 200)
-                .map(|(i, _)| &trimmed[i..])
-                .unwrap_or(trimmed)
-                .to_string()
-        } else {
-            trimmed.to_string()
-        }
+        crate::meeting_notes::wal_text_for_context(&full, 200)
     } else {
         String::new()
     }
 }
 
-/// Persist a delta to the WAL file and emit a `meeting-note-updated` event.
+/// Persist a WAL segment and emit a `meeting-note-updated` event.
 fn persist_and_emit(
     app: &AppHandle,
     state: &crate::AppState,
     history_dir: &std::path::Path,
     note_id: &Option<String>,
-    delta: &str,
+    segment: &crate::meeting_notes::WalSegment,
 ) {
-    if delta.is_empty() {
+    if segment.text.is_empty() {
         return;
     }
     if let Some(ref id) = note_id {
-        crate::meeting_notes::append_wal(history_dir, id, delta);
+        crate::meeting_notes::append_wal(history_dir, id, segment);
         let duration = state
             .meeting_start_time
             .lock()
@@ -79,7 +65,8 @@ fn persist_and_emit(
             "meeting-note-updated",
             serde_json::json!({
                 "id": id,
-                "delta": delta,
+                "delta": segment.text,
+                "speaker": segment.speaker,
                 "duration_secs": duration,
             }),
         );
@@ -88,15 +75,12 @@ fn persist_and_emit(
 
 /// Worker thread: receives segments from the segmenter, transcribes them,
 /// and persists/emits each result.
-///
-/// Owns `SpacingState` so spacing is consistent across all segments regardless
-/// of how long each transcription takes.
 fn run_meeting_worker(
     app: AppHandle,
     session_id: u64,
     label: &str,
     rx: mpsc::Receiver<Segment>,
-    mut transcribe: Box<dyn FnMut(&[f32], &str) -> String + Send + 'static>,
+    mut transcribe: Box<dyn FnMut(&[f32], f64, f64, &str) -> crate::meeting_notes::WalSegment + Send + 'static>,
 ) {
     let state = app.state::<crate::AppState>();
     let history_dir = crate::settings::history_dir();
@@ -105,8 +89,6 @@ fn run_meeting_worker(
         .lock()
         .ok()
         .and_then(|nid| nid.clone());
-
-    let mut spacing = SpacingState::new();
 
     for segment in rx {
         // Pre-transcription session check.
@@ -124,9 +106,9 @@ fn run_meeting_worker(
             break;
         }
 
-        let (samples, is_final) = match segment {
-            Segment::Tick(s) => (s, false),
-            Segment::Final(s) => (s, true),
+        let (samples, start_secs, end_secs, is_final) = match segment {
+            Segment::Tick { samples, start_secs, end_secs } => (samples, start_secs, end_secs, false),
+            Segment::Final { samples, start_secs, end_secs } => (samples, start_secs, end_secs, true),
         };
 
         if samples.is_empty() {
@@ -143,10 +125,16 @@ fn run_meeting_worker(
         let stt_samples = crate::transcribe::filter_with_vad(&state.vad_ctx, &samples)
             .unwrap_or(samples);
 
-        let seg_text = if stt_samples.is_empty() {
-            String::new()
+        let wal_segment = if stt_samples.is_empty() {
+            crate::meeting_notes::WalSegment {
+                speaker: String::new(),
+                start: start_secs,
+                end: end_secs,
+                text: String::new(),
+                words: vec![],
+            }
         } else {
-            transcribe(&stt_samples, &prev_text)
+            transcribe(&stt_samples, start_secs, end_secs, &prev_text)
         };
 
         // Post-transcription session check (transcription may take 10–60s).
@@ -163,12 +151,7 @@ fn run_meeting_worker(
             break;
         }
 
-        let delta = if is_final {
-            spacing.build_final_delta(&seg_text)
-        } else {
-            spacing.build_tick_delta(&seg_text)
-        };
-        persist_and_emit(&app, &state, &history_dir, &note_id, &delta);
+        persist_and_emit(&app, &state, &history_dir, &note_id, &wal_segment);
     }
 
     tracing::info!("[{label}] worker: finished processing all segments");
@@ -194,6 +177,7 @@ fn run_meeting_segmenter(
     let mut chunk_buf: Vec<f32> = Vec::new();
     let mut silence_count: u32 = 0;
     let mut had_speech_since_reset = false;
+    let mut total_samples_sent: usize = 0; // cumulative 16 kHz samples sent to worker
     const RMS_FALLBACK: f32 = 0.003;
 
     let mut last_tail: usize = 0;
@@ -290,8 +274,11 @@ fn run_meeting_segmenter(
                 );
             }
             let chunk = std::mem::take(&mut chunk_buf);
+            let start_secs = total_samples_sent as f64 / 16_000.0;
+            let end_secs = (total_samples_sent + chunk.len()) as f64 / 16_000.0;
+            total_samples_sent += chunk.len();
             // If send fails (worker exited early due to session change), stop.
-            if tx.send(Segment::Tick(chunk)).is_err() {
+            if tx.send(Segment::Tick { samples: chunk, start_secs, end_secs }).is_err() {
                 tracing::warn!("[{label}] segmenter: worker channel closed — stopping");
                 return;
             }
@@ -305,7 +292,9 @@ fn run_meeting_segmenter(
         "[{label}] segmenter: loop exited, sending Final segment ({} samples)",
         chunk_buf.len()
     );
-    let _ = tx.send(Segment::Final(chunk_buf));
+    let start_secs = total_samples_sent as f64 / 16_000.0;
+    let end_secs = (total_samples_sent + chunk_buf.len()) as f64 / 16_000.0;
+    let _ = tx.send(Segment::Final { samples: chunk_buf, start_secs, end_secs });
     // Normal path: tx dropped here → channel closes → worker's for-loop exits.
     // Failure path: if the worker already exited early (session change or cancellation),
     // send returns Err and the trailing audio is intentionally discarded.
@@ -319,15 +308,15 @@ fn run_meeting_segmenter(
 /// duration cap (e.g. `Some(120 * 16_000)` for 120 s).  Pass `None` to
 /// disable.
 ///
-/// `transcribe` receives VAD-filtered 16 kHz samples and the previous WAL
-/// context string (~200 chars).  It should return the transcribed text
-/// segment, or an empty string on failure / no speech.
+/// `transcribe` receives VAD-filtered 16 kHz samples, the segment start/end times
+/// in seconds (relative to meeting start), and the previous WAL context string.
+/// It returns a `WalSegment` with the transcribed text, speaker label, and word timestamps.
 pub(crate) fn run_meeting_feeder(
     app: AppHandle,
     session_id: u64,
     label: &str,
     max_segment_samples: Option<usize>,
-    transcribe: Box<dyn FnMut(&[f32], &str) -> String + Send + 'static>,
+    transcribe: Box<dyn FnMut(&[f32], f64, f64, &str) -> crate::meeting_notes::WalSegment + Send + 'static>,
 ) {
     let (tx, rx) = mpsc::channel::<Segment>();
 
