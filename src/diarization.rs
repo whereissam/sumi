@@ -1293,7 +1293,7 @@ pub(crate) fn pyannote_diarize(
     // audio typically has shorter turns — if speaker B only speaks for 1–2 s per 10 s
     // window, they never hit 118 exclusive frames and their embeddings all get assigned
     // to the dominant speaker's centroid, collapsing 2 speakers → 1.
-    const MIN_RELIABLE_FRAMES: usize = 30;
+    const MIN_RELIABLE_FRAMES: usize = 60; // ≈ 1 s exclusive speech; calibrated min for reliable WeSpeaker embeddings
 
     let num_windows = if total <= SEG_WINDOW_SAMPLES {
         1
@@ -1387,28 +1387,71 @@ pub(crate) fn pyannote_diarize(
         .filter(|&i| all_embs[i].is_some())
         .collect();
 
+    tracing::info!(
+        "[diarize] windows={} valid_embs={} reliable_embs={} (min_frames>={})",
+        num_windows,
+        valid_idx.len(),
+        reliable_idx.len(),
+        MIN_RELIABLE_FRAMES,
+    );
+    if reliable_idx.len() >= 2 {
+        let rel_vecs_diag: Vec<&Vec<f32>> = reliable_idx.iter()
+            .map(|&i| all_embs[i].as_ref().unwrap())
+            .collect();
+        let mut min_d = f32::MAX;
+        let mut max_d = 0.0f32;
+        for i in 0..rel_vecs_diag.len() {
+            for j in (i + 1)..rel_vecs_diag.len() {
+                let d: f32 = rel_vecs_diag[i].iter().zip(rel_vecs_diag[j].iter())
+                    .map(|(a, b)| (a - b) * (a - b))
+                    .sum::<f32>()
+                    .sqrt();
+                min_d = min_d.min(d);
+                max_d = max_d.max(d);
+            }
+        }
+        tracing::info!(
+            "[diarize] reliable emb euclidean: min={:.4} max={:.4} threshold={:.4}",
+            min_d, max_d, PYANNOTE_THRESHOLD,
+        );
+    }
+
     if valid_idx.is_empty() {
         return vec![];
     }
 
     // Cluster reliable embeddings.
-    let (cluster_labels, num_global_speakers, centroids) = if reliable_idx.is_empty() {
-        // Fallback: cluster all valid embeddings if none are reliable.
-        let vecs: Vec<Vec<f32>> = valid_idx.iter()
+    // If reliable-only clustering yields 1 speaker but there are ≥2 valid embeddings,
+    // fall back to clustering all valid embeddings. This handles the case where the
+    // minority speaker never has enough exclusive speech per window to qualify as
+    // "reliable", causing them to be silently absorbed into the dominant speaker.
+    let cluster_fn = |idxs: &[usize]| {
+        let vecs: Vec<Vec<f32>> = idxs.iter()
             .map(|&i| all_embs[i].as_ref().unwrap().clone())
             .collect();
         let labels = centroid_linkage_cluster(&vecs, PYANNOTE_THRESHOLD, 12);
         let k = labels.iter().max().map(|&m| m + 1).unwrap_or(1);
         let centroids = compute_centroids(&vecs, &labels, k);
         (labels, k, centroids)
+    };
+
+    let (cluster_labels, num_global_speakers, centroids) = if reliable_idx.is_empty() {
+        // No reliable embeddings: cluster all valid.
+        tracing::info!("[diarize] no reliable embeddings, clustering all valid");
+        cluster_fn(&valid_idx)
     } else {
-        let rel_vecs: Vec<Vec<f32>> = reliable_idx.iter()
-            .map(|&i| all_embs[i].as_ref().unwrap().clone())
-            .collect();
-        let labels = centroid_linkage_cluster(&rel_vecs, PYANNOTE_THRESHOLD, 12);
-        let k = labels.iter().max().map(|&m| m + 1).unwrap_or(1);
-        let centroids = compute_centroids(&rel_vecs, &labels, k);
-        (labels, k, centroids)
+        let (labels, k, centroids) = cluster_fn(&reliable_idx);
+        if k <= 1 && valid_idx.len() >= 2 {
+            // Reliable-only collapsed to 1 speaker; minority speaker likely had no
+            // reliable frames. Retry with all valid embeddings.
+            tracing::info!(
+                "[diarize] reliable clustering → 1 speaker; retrying with all {} valid embs",
+                valid_idx.len()
+            );
+            cluster_fn(&valid_idx)
+        } else {
+            (labels, k, centroids)
+        }
     };
 
     // Build flat label map: embedding index → global label.
