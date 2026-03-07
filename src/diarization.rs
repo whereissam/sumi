@@ -368,17 +368,21 @@ pub(crate) struct WeSpeakerExtractor {
 
 impl WeSpeakerExtractor {
     pub fn new(model_path: &Path) -> Result<Self, String> {
-        // Use CoreML on Apple Silicon for ~2-6× speedup on segments ≥ 3 s.
-        // 99/113 ops are CoreML-compatible; fallback to CPU for the rest.
-        // Segmentation model intentionally uses CPU-only: only 12/50 ops are
-        // CoreML-compatible, making CoreML slower there due to fallback overhead.
+        let use_coreml = std::env::var("SUMI_COREML").map(|v| v == "1").unwrap_or(true);
         #[cfg(target_os = "macos")]
-        let session = ort::session::Session::builder()
-            .map_err(|e| format!("ORT builder: {e}"))?
-            .with_execution_providers([ort::execution_providers::CoreMLExecutionProvider::default().build()])
-            .map_err(|e| format!("CoreML EP: {e}"))?
-            .commit_from_file(model_path)
-            .map_err(|e| format!("Load WeSpeaker ResNet34-LM: {e}"))?;
+        let session = if use_coreml {
+            ort::session::Session::builder()
+                .map_err(|e| format!("ORT builder: {e}"))?
+                .with_execution_providers([ort::execution_providers::CoreMLExecutionProvider::default().build()])
+                .map_err(|e| format!("CoreML EP: {e}"))?
+                .commit_from_file(model_path)
+                .map_err(|e| format!("Load WeSpeaker ResNet34-LM: {e}"))?
+        } else {
+            ort::session::Session::builder()
+                .map_err(|e| format!("ORT builder: {e}"))?
+                .commit_from_file(model_path)
+                .map_err(|e| format!("Load WeSpeaker ResNet34-LM: {e}"))?
+        };
         #[cfg(not(target_os = "macos"))]
         let session = ort::session::Session::builder()
             .map_err(|e| format!("ORT builder: {e}"))?
@@ -3363,8 +3367,9 @@ mod integration {
             }
         }
 
-        let out_path = "/tmp/rust_results_pyannote.txt";
-        std::fs::write(out_path, output_lines.join("\n")).expect("write results");
+        let out_path = std::env::var("SUMI_OUT_PATH")
+            .unwrap_or_else(|_| "/tmp/rust_results_pyannote.txt".to_string());
+        std::fs::write(&out_path, output_lines.join("\n")).expect("write results");
         println!("\n結果已儲存至 {out_path}");
     }
 
