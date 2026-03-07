@@ -1856,31 +1856,34 @@ fn start_meeting_mode(app: &AppHandle) {
     state.meeting_stopping.store(false, Ordering::SeqCst);
     state.meeting_feeder_done.store(false, Ordering::SeqCst);
 
-    // Load or reset the speaker diarization engine for the new session.
+    // Load the speaker diarization engine *outside* the lock so model I/O
+    // (2–5 s) does not block concurrent diarization_ctx readers.
     let diarization_enabled = state.settings.lock()
         .map(|s| s.meeting_diarization_enabled)
         .unwrap_or(false);
-    {
-        let mut diar = state.diarization_ctx.lock().unwrap_or_else(|e| e.into_inner());
-        if diarization_enabled {
-            let model_path = settings::diarization_model_path();
-            if model_path.exists() {
-                let seg_path = settings::segmentation_model_path();
-                let seg_opt = if seg_path.exists() { Some(seg_path.as_path()) } else { None };
-                // Always recreate so that a newly-downloaded segmentation model
-                // is picked up even when an engine already exists from a prior session.
-                match diarization::DiarizationEngine::new(&model_path, seg_opt) {
-                    Ok(engine) => *diar = Some(engine),
-                    Err(e) => tracing::warn!("[diarization] failed to load model: {e}"),
+    let new_diar_engine: Option<diarization::DiarizationEngine> = if diarization_enabled {
+        let model_path = settings::diarization_model_path();
+        if model_path.exists() {
+            let seg_path = settings::segmentation_model_path();
+            // Always recreate so that a newly-downloaded segmentation model
+            // is picked up even when an engine already exists from a prior session.
+            let seg_opt = if seg_path.exists() { Some(seg_path) } else { None };
+            match diarization::DiarizationEngine::new(&model_path, seg_opt.as_deref()) {
+                Ok(engine) => Some(engine),
+                Err(e) => {
+                    tracing::warn!("[diarization] failed to load model: {e}");
+                    None
                 }
-            } else {
-                tracing::warn!("[diarization] model not found at {} — diarization disabled", model_path.display());
             }
         } else {
-            // Diarization disabled — clear any loaded engine to free memory.
-            *diar = None;
+            tracing::warn!("[diarization] model not found at {} — diarization disabled", model_path.display());
+            None
         }
-    }
+    } else {
+        None // Diarization disabled — None clears any loaded engine and frees memory.
+    };
+    // Swap in atomically; lock held only for the pointer swap, not model I/O.
+    *state.diarization_ctx.lock().unwrap_or_else(|e| e.into_inner()) = new_diar_engine;
 
     let preferred_device = state.settings.lock().ok().and_then(|s| s.mic_device.clone());
 

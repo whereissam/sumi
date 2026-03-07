@@ -65,8 +65,15 @@ pub struct SegmentationModel {
     session: ort::session::Session,
 }
 
-// SAFETY: ort::session::Session is Send+Sync in ort 2.x (sessions are protected
-// by an internal mutex and contain no thread-local state).
+// Compile-time proof that the assumption below holds: ort::session::Session
+// implements Send in ort 2.x (via `unsafe impl Send for Session {}` in
+// ort/src/session/mod.rs). If it did not, the assertion would fail to compile.
+const _: fn() = || {
+    fn _assert_send<T: Send>() {}
+    _assert_send::<ort::session::Session>();
+};
+// SAFETY: ort::session::Session is Send in ort 2.x (verified by assertion
+// above). SegmentationModel wraps only Session; no thread-local state.
 unsafe impl Send for SegmentationModel {}
 
 impl SegmentationModel {
