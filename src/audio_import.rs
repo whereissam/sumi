@@ -404,6 +404,8 @@ fn run_import_inner(app: &AppHandle, file_path: &str) -> Result<String, String> 
                         "id": note_id,
                         "delta": text,
                         "speaker": speaker,
+                        "start": *start_s,
+                        "end": *end_s,
                         "duration_secs": duration_secs,
                     }),
                 );
@@ -460,6 +462,8 @@ fn run_import_inner(app: &AppHandle, file_path: &str) -> Result<String, String> 
                         "id": note_id,
                         "delta": text,
                         "speaker": "",
+                        "start": start_secs,
+                        "end": end_secs,
                         "duration_secs": duration_secs,
                     }),
                 );

@@ -876,6 +876,8 @@ pub fn run() {
             commands::polish_meeting_note,
             commands::import_meeting_audio,
             commands::cancel_import,
+            commands::start_infra_downloads,
+            commands::check_infra_models_ready,
         ])
         .setup(|app| {
             // Initialize logger

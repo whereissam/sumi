@@ -2783,6 +2783,181 @@ pub fn delete_segmentation_model(state: State<'_, AppState>) -> Result<u64, Stri
     Ok(size)
 }
 
+// ── Infra downloads (background, fire-and-forget) ────────────────────────────
+
+/// Download the 3 infrastructure models (VAD, segmentation, embedding) in
+/// background threads.  Fire-and-forget: called at onboarding start, does not
+/// block, and silently skips models that are already present.
+#[tauri::command]
+pub fn start_infra_downloads(app: AppHandle) {
+    let dir = settings::models_dir();
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+
+    // VAD model (~1.6 MB)
+    {
+        let app2 = app.clone();
+        let vad_path = crate::transcribe::vad_model_path();
+        if !vad_path.exists() {
+            std::thread::spawn(move || {
+                download_infra_file(
+                    &app2,
+                    "https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v6.2.0.bin",
+                    &vad_path,
+                    "vad",
+                );
+            });
+        }
+    }
+
+    // Segmentation model (~5.9 MB)
+    {
+        let app2 = app.clone();
+        let seg_path = settings::segmentation_model_path();
+        if !seg_path.exists() {
+            std::thread::spawn(move || {
+                download_infra_file(
+                    &app2,
+                    crate::diarization::SEGMENTATION_URL,
+                    &seg_path,
+                    "segmentation",
+                );
+            });
+        }
+    }
+
+    // Embedding model (~26.5 MB)
+    {
+        let app2 = app.clone();
+        let emb_path = settings::diarization_model_path();
+        if !emb_path.exists() {
+            std::thread::spawn(move || {
+                download_infra_file(
+                    &app2,
+                    crate::diarization::WESPEAKER_URL,
+                    &emb_path,
+                    "embedding",
+                );
+            });
+        }
+    }
+}
+
+/// Download a single infrastructure model file.  Uses a `.ipart` tmp extension
+/// distinct from the `.part` suffix used by user-initiated downloads, so the
+/// two can coexist without clobbering each other.
+fn download_infra_file(app: &AppHandle, url: &str, dest: &std::path::Path, model: &str) {
+    use std::io::Read as _;
+
+    // If another thread (or a prior call) already placed the final file, skip.
+    if dest.exists() {
+        return;
+    }
+
+    let tmp = dest.with_extension("ipart");
+
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("infra {}: build client: {}", model, e);
+            return;
+        }
+    };
+
+    let resp = match client.get(url).send() {
+        Ok(r) if r.status().is_success() => r,
+        Ok(r) => {
+            tracing::warn!("infra {}: HTTP {}", model, r.status());
+            return;
+        }
+        Err(e) => {
+            tracing::warn!("infra {}: request failed: {}", model, e);
+            return;
+        }
+    };
+
+    let total = resp.content_length().unwrap_or(0);
+
+    let mut file = match std::fs::File::create(&tmp) {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!("infra {}: create tmp: {}", model, e);
+            return;
+        }
+    };
+
+    let mut downloaded: u64 = 0;
+    let mut buf = [0u8; 65536];
+    let mut reader = resp;
+    let mut last_emit = Instant::now();
+
+    loop {
+        let n = match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!("infra {}: read error: {}", model, e);
+                let _ = std::fs::remove_file(&tmp);
+                return;
+            }
+        };
+        if let Err(e) = std::io::Write::write_all(&mut file, &buf[..n]) {
+            tracing::warn!("infra {}: write error: {}", model, e);
+            let _ = std::fs::remove_file(&tmp);
+            return;
+        }
+        downloaded += n as u64;
+
+        if last_emit.elapsed() >= std::time::Duration::from_millis(500) {
+            let _ = app.emit(
+                "infra-download-progress",
+                serde_json::json!({
+                    "model": model,
+                    "downloaded": downloaded,
+                    "total": total,
+                    "status": "downloading",
+                }),
+            );
+            last_emit = Instant::now();
+        }
+    }
+
+    drop(file);
+    if let Err(e) = std::fs::rename(&tmp, dest) {
+        tracing::warn!("infra {}: rename failed: {}", model, e);
+        let _ = std::fs::remove_file(&tmp);
+        return;
+    }
+
+    let _ = app.emit(
+        "infra-download-progress",
+        serde_json::json!({
+            "model": model,
+            "status": "complete",
+            "downloaded": downloaded,
+            "total": total,
+        }),
+    );
+    tracing::info!("infra {} complete: {:?}", model, dest);
+}
+
+#[tauri::command]
+pub fn check_infra_models_ready() -> serde_json::Value {
+    let vad = crate::transcribe::vad_model_path().exists();
+    let seg = settings::segmentation_model_path().exists();
+    let emb = settings::diarization_model_path().exists();
+    serde_json::json!({
+        "ready": vad && seg && emb,
+        "vad": vad,
+        "segmentation": seg,
+        "embedding": emb,
+    })
+}
+
 // ── Meeting Notes ──
 
 #[tauri::command]
