@@ -1395,17 +1395,13 @@ pub(crate) fn pyannote_diarize(
         MIN_RELIABLE_FRAMES,
     );
     if reliable_idx.len() >= 2 {
-        let rel_vecs_diag: Vec<&Vec<f32>> = reliable_idx.iter()
-            .map(|&i| all_embs[i].as_ref().unwrap())
-            .collect();
         let mut min_d = f32::MAX;
         let mut max_d = 0.0f32;
-        for i in 0..rel_vecs_diag.len() {
-            for j in (i + 1)..rel_vecs_diag.len() {
-                let d: f32 = rel_vecs_diag[i].iter().zip(rel_vecs_diag[j].iter())
-                    .map(|(a, b)| (a - b) * (a - b))
-                    .sum::<f32>()
-                    .sqrt();
+        for ii in 0..reliable_idx.len() {
+            for jj in (ii + 1)..reliable_idx.len() {
+                let a = all_embs[reliable_idx[ii]].as_ref().unwrap();
+                let b = all_embs[reliable_idx[jj]].as_ref().unwrap();
+                let d = sq_euclidean(a, b).sqrt();
                 min_d = min_d.min(d);
                 max_d = max_d.max(d);
             }

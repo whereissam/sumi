@@ -763,21 +763,15 @@ fn cleanup_obsolete_models(models_dir: &std::path::Path) {
     }
 
     // Diarization infra models (speaker embedding + segmentation).
-    let emb_filename_owned;
-    if let Some(name) = settings::diarization_model_path()
-        .file_name()
-        .and_then(|n| n.to_str())
-    {
-        emb_filename_owned = name.to_owned();
-        known_files.insert(&emb_filename_owned);
-    }
-    let seg_filename_owned;
-    if let Some(name) = settings::segmentation_model_path()
-        .file_name()
-        .and_then(|n| n.to_str())
-    {
-        seg_filename_owned = name.to_owned();
-        known_files.insert(&seg_filename_owned);
+    let diar_filenames: Vec<String> = [
+        settings::diarization_model_path(),
+        settings::segmentation_model_path(),
+    ]
+    .iter()
+    .filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(str::to_owned))
+    .collect();
+    for name in &diar_filenames {
+        known_files.insert(name.as_str());
     }
 
     let Ok(entries) = std::fs::read_dir(models_dir) else {
