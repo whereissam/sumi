@@ -48,8 +48,9 @@ pub const SEGMENTATION_URL: &str =
     "https://github.com/thewh1teagle/pyannote-rs/releases/download/v0.1.0/segmentation-3.0.onnx";
 
 /// WeSpeaker embedding model download URL (pyannote-rs v0.1.0 release).
+/// Filename uses CAM++ architecture; URL-encoded because `+` is special in URLs.
 pub const WESPEAKER_URL: &str =
-    "https://github.com/thewh1teagle/pyannote-rs/releases/download/v0.1.0/wespeaker-voxceleb-resnet34-LM.onnx";
+    "https://github.com/thewh1teagle/pyannote-rs/releases/download/v0.1.0/wespeaker_en_voxceleb_CAM%2B%2B.onnx";
 
 // ── Segmentation model ─────────────────────────────────────────────────────────
 
@@ -236,7 +237,7 @@ impl SegmentationModel {
 /// Offline agglomerative hierarchical clustering (average linkage).
 ///
 /// Direct port from `exp_g_diarize_agglomerative.rs`.
-/// Threshold calibrated to 0.50 for `wespeaker-voxceleb-resnet34-LM.onnx` with 5 s cap:
+/// Threshold calibrated to 0.50 for `wespeaker_en_voxceleb_CAM++.onnx` with 5 s cap:
 /// same-speaker cosine distance ≤ 0.09, different-speaker > 0.51.
 ///
 /// Embeddings must already be L2-normalised before calling.
@@ -445,7 +446,7 @@ impl DiarizationEngine {
         Ok(Self {
             emb_extractor,
             segmentation,
-            // Threshold calibrated for wespeaker-voxceleb-resnet34-LM.onnx + 5 s cap:
+            // Threshold calibrated for wespeaker_en_voxceleb_CAM++.onnx + 5 s cap:
             // same-speaker dist ≤ 0.09 (for comparable lengths), inter-speaker > 0.51.
             // 0.50 cleanly separates speakers while tolerating short-segment noise.
             clusters: SpeakerClusters::new(0.50),
@@ -829,7 +830,7 @@ mod tests {
 // Models are loaded from the standard dev model directory
 // (~/.sumi-dev/models/).  Copy or symlink the ONNX files there before running:
 //   segmentation-3.0.onnx       (5.7 MB)
-//   wespeaker-voxceleb-resnet34-LM.onnx  (28 MB)
+//   wespeaker_en_voxceleb_CAM++.onnx  (28 MB)
 //
 // Test audio: set SUMI_TEST_AUDIO_DIR to a directory containing:
 //   voxconv11_60s.wav   (~60 s, 2-speaker clip, validated at DER=10.5%)
@@ -1079,7 +1080,7 @@ mod integration {
 
     /// Verify WeSpeaker produces non-zero 512-dim embeddings from real speech.
     #[test]
-    #[ignore = "requires wespeaker-voxceleb-resnet34-LM.onnx in ~/.sumi-dev/models/"]
+    #[ignore = "requires wespeaker_en_voxceleb_CAM++.onnx in ~/.sumi-dev/models/"]
     fn wespeaker_produces_512_dim_embedding() {
         let emb_path = crate::settings::diarization_model_path();
         assert!(emb_path.exists(), "WeSpeaker model not found: {}", emb_path.display());

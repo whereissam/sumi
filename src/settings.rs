@@ -114,7 +114,7 @@ pub fn logs_dir() -> PathBuf {
 }
 
 pub fn diarization_model_path() -> PathBuf {
-    models_dir().join("wespeaker-voxceleb-resnet34-LM.onnx")
+    models_dir().join("wespeaker_en_voxceleb_CAM++.onnx")
 }
 
 pub fn segmentation_model_path() -> PathBuf {
