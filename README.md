@@ -62,6 +62,8 @@ LLM rewriting works the same way: local models via candle with Metal/CUDA (Llama
 
 In full local mode, audio never leaves your Mac. You can verify that because the code is here.
 
+Resource usage: the app idles around 130 MB and 0% CPU. The first local transcription loads the Whisper model into GPU memory — RSS climbs to around 730 MB, but Metal handles the inference so CPU peaks under 20%. Cloud mode adds about 7 MB during a recording and drops straight back to 0% CPU when it's done.
+
 Other things worth knowing:
 
 - Edit by Voice: select text, press `Ctrl+Option+Z`, say what you want done. The AI rewrites and pastes it back.
