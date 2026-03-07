@@ -341,7 +341,7 @@ pub(crate) fn transcribe_meeting_chunk<'a>(
 ///
 /// Word timestamps from DTW allow precise text assignment to each sub-segment.
 pub(crate) fn run_whisper_meeting_feeder_loop(app: AppHandle, language: String, session_id: u64) {
-    use crate::meeting_notes::{WalSegment, WordTs};
+    use crate::meeting_notes::WalSegment;
 
     let app_for_closure = app.clone();
     let transcribe: Box<

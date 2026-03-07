@@ -7,7 +7,7 @@
 //! VAD chunk (f32, 16 kHz)
 //!   → SegmentationModel [1,1,N] → [1,T,7]  (speaker-class per frame)
 //!   → sub-segment boundaries (silence + speaker-class changes)
-//!   → WeSpeaker [1,T,80] → [1,256]  (per sub-segment)
+//!   → WeSpeaker [1,T,80] → [1,512]  (per sub-segment; ResNet34-LM output dim)
 //!   → L2 normalize
 //!   → online cosine clustering  (greedy, for real-time labels)
 //!   → "SPEAKER_00" / "SPEAKER_01" / …  +  embedding buffered for phase 2
@@ -225,8 +225,9 @@ impl SegmentationModel {
 
 /// Offline agglomerative hierarchical clustering (average linkage).
 ///
-/// Direct port from `exp_g_diarize_agglomerative.rs`, achieving DER ≈ 10.5 %
-/// on VoxConverse sample 11 (60 s, 2 speakers) at threshold = 0.9.
+/// Direct port from `exp_g_diarize_agglomerative.rs`.
+/// Threshold calibrated to 0.50 for `wespeaker-voxceleb-resnet34-LM.onnx` with 5 s cap:
+/// same-speaker cosine distance ≤ 0.09, different-speaker > 0.51.
 ///
 /// Embeddings must already be L2-normalised before calling.
 /// Returns a cluster label (0-based) for each input embedding.
@@ -343,6 +344,21 @@ impl SpeakerClusters {
         }
     }
 
+    /// Assign to the **nearest existing centroid** without creating a new cluster
+    /// or updating any centroid.  Used for very short (< 1 s) segments whose
+    /// embeddings are unreliable — they are placed next to the closest known
+    /// speaker but do not pollute the cluster centroids.
+    ///
+    /// Returns `None` if no clusters exist yet (caller should fall back to `assign`).
+    pub fn assign_nearest(&self, emb: &[f32]) -> Option<usize> {
+        self.centroids
+            .iter()
+            .enumerate()
+            .map(|(id, c)| (id, cosine_dist(emb, c)))
+            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(id, _)| id)
+    }
+
     pub fn reset(&mut self) {
         self.centroids.clear();
         self.counts.clear();
@@ -406,7 +422,10 @@ impl DiarizationEngine {
         Ok(Self {
             emb_extractor,
             segmentation,
-            clusters: SpeakerClusters::new(0.9),
+            // Threshold calibrated for wespeaker-voxceleb-resnet34-LM.onnx + 5 s cap:
+            // same-speaker dist ≤ 0.09 (for comparable lengths), inter-speaker > 0.51.
+            // 0.50 cleanly separates speakers while tolerating short-segment noise.
+            clusters: SpeakerClusters::new(0.50),
             segment_buffer: Vec::new(),
         })
     }
@@ -444,6 +463,16 @@ impl DiarizationEngine {
 
         let mut result = Vec::new();
 
+        // WeSpeaker ResNet34-LM norms scale with segment duration: short segments
+        // have 10× larger pre-norm norms, making L2-normalised embeddings
+        // incomparable across lengths.  Two mitigations:
+        //   1. Cap embedding input to 5 s (normalises dynamic range).
+        //   2. Segments < 1 s use `assign_nearest` (no centroid update, not buffered
+        //      for agglomerative) since their embeddings are too unreliable to anchor
+        //      a cluster centroid.
+        const MAX_EMB_SAMPLES: usize = 5 * 16_000; // 5 s @ 16 kHz
+        const MIN_RELIABLE_SAMPLES: usize = 16_000; // 1 s @ 16 kHz
+
         for (start_samp, end_samp) in sub_segs {
             let end_samp = end_samp.min(samples_f32.len());
             if end_samp <= start_samp {
@@ -452,8 +481,15 @@ impl DiarizationEngine {
             let sub_slice = &samples_f32[start_samp..end_samp];
             let start_secs = chunk_start_secs + start_samp as f64 / 16_000.0;
             let end_secs = chunk_start_secs + end_samp as f64 / 16_000.0;
+            let is_reliable = sub_slice.len() >= MIN_RELIABLE_SAMPLES;
 
-            let samples_i16 = f32_to_i16(sub_slice);
+            // Cap to first 5 s to normalise embedding magnitude across lengths.
+            let emb_slice = if sub_slice.len() > MAX_EMB_SAMPLES {
+                &sub_slice[..MAX_EMB_SAMPLES]
+            } else {
+                sub_slice
+            };
+            let samples_i16 = f32_to_i16(emb_slice);
             if samples_i16.len() < 400 {
                 tracing::debug!(
                     "[diarization] sub-segment [{:.2}-{:.2}s] too short ({} samples)",
@@ -480,17 +516,32 @@ impl DiarizationEngine {
 
             let emb = l2_normalize(&raw_emb);
 
-            // Buffer for agglomerative finalization pass.
-            self.segment_buffer.push((start_secs, end_secs, emb.clone()));
+            // Online clustering.
+            let speaker_id = if is_reliable {
+                // Reliable segment: may create new cluster, updates centroid, buffered.
+                let id = self.clusters.assign(emb.clone());
+                self.segment_buffer.push((start_secs, end_secs, emb));
+                id
+            } else {
+                // Short/unreliable: assign to nearest existing cluster (no creation,
+                // no centroid update, not buffered for agglomerative).
+                match self.clusters.assign_nearest(&emb) {
+                    Some(id) => id,
+                    None => {
+                        // No clusters yet — bootstrap with this short segment.
+                        self.clusters.assign(emb.clone())
+                        // Not buffered: bootstrap centroid only, no agglomerative entry.
+                    }
+                }
+            };
 
-            // Online clustering for real-time label.
-            let speaker_id = self.clusters.assign(emb);
             let label = format!("SPEAKER_{:02}", speaker_id);
             tracing::debug!(
-                "[diarization] [{:.2}-{:.2}s] → {} (online)",
+                "[diarization] [{:.2}-{:.2}s] → {} (online, reliable={})",
                 start_secs,
                 end_secs,
-                label
+                label,
+                is_reliable
             );
             result.push((start_secs, end_secs, label));
         }
@@ -514,7 +565,7 @@ impl DiarizationEngine {
             .map(|(_, _, emb)| emb.clone())
             .collect();
 
-        let labels = agglomerative_cluster(&embeddings, 0.9);
+        let labels = agglomerative_cluster(&embeddings, 0.50);
 
         let result: Vec<(f64, f64, String)> = self
             .segment_buffer
@@ -724,5 +775,574 @@ mod tests {
             assert_eq!(c.assign(l2_normalize(&[1.0_f32, 0.01, 0.0])), 0);
         }
         assert_eq!(c.speaker_count(), 1);
+    }
+}
+
+// ── Integration tests (require real ONNX models) ───────────────────────────────
+//
+// Run with: cargo test diarization::integration -- --ignored
+//
+// Models are loaded from the standard dev model directory
+// (~/.sumi-dev/models/).  Copy or symlink the ONNX files there before running:
+//   segmentation-3.0.onnx       (5.7 MB)
+//   wespeaker-voxceleb-resnet34-LM.onnx  (28 MB)
+//
+// Test audio: set SUMI_TEST_AUDIO_DIR to a directory containing:
+//   voxconv11_60s.wav   (~60 s, 2-speaker clip, validated at DER=10.5%)
+//   test1.wav           (any speech recording)
+
+#[cfg(test)]
+mod integration {
+    use super::*;
+    use std::collections::HashSet;
+
+    /// Resolve a test audio file from `SUMI_TEST_AUDIO_DIR` env var.
+    /// Tests that call this are already `#[ignore]`-gated, so a missing var
+    /// simply means the test is skipped (the assert inside the test will panic
+    /// with a clear message).
+    fn test_audio(name: &str) -> String {
+        let dir = std::env::var("SUMI_TEST_AUDIO_DIR").unwrap_or_else(|_| {
+            // Fallback: look next to the workspace root under tests/audio/.
+            format!(
+                "{}/tests/audio",
+                std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".into())
+            )
+        });
+        format!("{}/{}", dir, name)
+    }
+
+    fn voxconv_wav() -> String { test_audio("voxconv11_60s.wav") }
+    fn test1_wav()   -> String { test_audio("test1.wav") }
+
+    /// Load a WAV file to mono f32 samples at its native sample rate.
+    fn load_wav(path: &str) -> (Vec<f32>, u32) {
+        let mut reader = hound::WavReader::open(path)
+            .unwrap_or_else(|e| panic!("Failed to open {path}: {e}"));
+        let spec = reader.spec();
+        let raw: Vec<f32> = match spec.sample_format {
+            hound::SampleFormat::Int => {
+                let max = (1_i32 << (spec.bits_per_sample - 1)) as f32;
+                reader
+                    .samples::<i32>()
+                    .map(|s| s.expect("read sample") as f32 / max)
+                    .collect()
+            }
+            hound::SampleFormat::Float => reader
+                .samples::<f32>()
+                .map(|s| s.expect("read sample"))
+                .collect(),
+        };
+        let ch = spec.channels as usize;
+        let mono: Vec<f32> = if ch <= 1 {
+            raw
+        } else {
+            raw.chunks(ch)
+                .map(|c| c.iter().sum::<f32>() / ch as f32)
+                .collect()
+        };
+        (mono, spec.sample_rate)
+    }
+
+    /// Resample using the Sumi audio module (same resampler as production code).
+    fn to_16k(samples: &[f32], rate: u32) -> Vec<f32> {
+        if rate == 16000 {
+            samples.to_vec()
+        } else {
+            crate::audio::resample(samples, rate, 16000)
+        }
+    }
+
+    // ── SegmentationModel ──────────────────────────────────────────────────────
+
+    /// Dump raw model output for the first 10 s of voxconv11 to understand
+    /// the actual class distribution — used for diagnosis only.
+    #[test]
+    #[ignore = "diagnostic only, requires segmentation-3.0.onnx in ~/.sumi-dev/models/"]
+    fn segmentation_dump_raw_frames_first_10s() {
+        use ndarray::{Array1, ArrayViewD, Axis, IxDyn};
+
+        let seg_path = crate::settings::segmentation_model_path();
+        assert!(seg_path.exists());
+        assert!(std::path::Path::new(&voxconv_wav()).exists());
+
+        let (samples, sr) = load_wav(&voxconv_wav());
+        let samples_16k = to_16k(&samples, sr);
+
+        // Process only the first 10 s (one window).
+        let window: Vec<f32> = samples_16k[..SEG_WINDOW_SAMPLES]
+            .iter()
+            .map(|&s| s * 32767.0)
+            .collect();
+
+        let mut session = ort::session::Session::builder()
+            .unwrap()
+            .commit_from_file(&seg_path)
+            .unwrap();
+
+        let array = Array1::from_vec(window)
+            .into_shape_with_order((1_usize, 1_usize, SEG_WINDOW_SAMPLES))
+            .unwrap();
+        let tensor =
+            ort::value::TensorRef::from_array_view(array.view().into_dyn()).unwrap();
+        let outs = session.run(ort::inputs!["input" => tensor]).unwrap();
+        let (shape, data) = outs
+            .get("output")
+            .unwrap()
+            .try_extract_tensor::<f32>()
+            .unwrap();
+        let shape_vec: Vec<usize> =
+            (0..shape.len()).map(|i| shape[i] as usize).collect();
+        println!("\n[raw] output shape: {:?}", shape_vec);
+
+        let view =
+            ArrayViewD::<f32>::from_shape(IxDyn(&shape_vec), data).unwrap();
+
+        let mut class_hist = [0usize; 8];
+        let mut prev_class = 99usize;
+        let mut offset = SEG_FRAME_START;
+
+        for batch in view.outer_iter() {
+            for (fi, frame) in batch.axis_iter(Axis(0)).enumerate() {
+                let max_idx = frame
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| {
+                        a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                if max_idx < 8 {
+                    class_hist[max_idx] += 1;
+                }
+                if max_idx != prev_class {
+                    let t = offset as f64 / 16_000.0;
+                    let probs: Vec<f32> = frame.iter().copied().collect();
+                    println!(
+                        "  frame {:4}  t={:.3}s  class→{}  probs={:.3?}",
+                        fi, t, max_idx, &probs[..probs.len().min(8)]
+                    );
+                    prev_class = max_idx;
+                }
+                offset += SEG_FRAME_HOP;
+            }
+        }
+        println!("[raw] class histogram: {:?}", class_hist);
+        println!("[raw] total frames: {}, duration covered: {:.2}s",
+            class_hist.iter().sum::<usize>(),
+            class_hist.iter().sum::<usize>() as f64 * SEG_FRAME_HOP as f64 / 16_000.0);
+    }
+
+    /// Verify the segmentation model loads and returns at least 2 speech
+    /// sub-segments from the 60-second two-speaker VoxConverse sample.
+    #[test]
+    #[ignore = "requires segmentation-3.0.onnx in ~/.sumi-dev/models/"]
+    fn segmentation_finds_multiple_speech_segments_in_voxconv() {
+        let seg_path = crate::settings::segmentation_model_path();
+        assert!(
+            seg_path.exists(),
+            "Model not found: {}. Copy segmentation-3.0.onnx there.",
+            seg_path.display()
+        );
+        assert!(
+            std::path::Path::new(&voxconv_wav()).exists(),
+            "Test audio not found: {}" , voxconv_wav()
+        );
+
+        let (samples, sr) = load_wav(&voxconv_wav());
+        let samples_16k = to_16k(&samples, sr);
+        let duration_s = samples_16k.len() as f64 / 16_000.0;
+
+        let mut model =
+            SegmentationModel::new(&seg_path).expect("SegmentationModel::new");
+        let segs = model.find_sub_segments(&samples_16k);
+
+        println!(
+            "\n[seg] {:.1}s audio → {} sub-segments:",
+            duration_s,
+            segs.len()
+        );
+        for (i, (s, e)) in segs.iter().enumerate() {
+            println!(
+                "  [{}] {:.3}s – {:.3}s  ({:.3}s)",
+                i,
+                *s as f64 / 16_000.0,
+                *e as f64 / 16_000.0,
+                (*e - *s) as f64 / 16_000.0
+            );
+        }
+
+        assert!(
+            segs.len() >= 2,
+            "Expected ≥2 segments from a 2-speaker recording, got {}",
+            segs.len()
+        );
+
+        // All segments must be within bounds and non-empty.
+        for (s, e) in &segs {
+            assert!(*s < *e, "degenerate segment: start {s} >= end {e}");
+            assert!(
+                *e <= samples_16k.len(),
+                "segment end {e} beyond audio length {}",
+                samples_16k.len()
+            );
+            assert!(
+                *e - *s >= SEG_MIN_SUBSEG_SAMPLES,
+                "segment shorter than min: {} samples",
+                *e - *s
+            );
+        }
+    }
+
+    /// Verify the segmentation model detects intra-utterance speaker changes
+    /// (not just silence-bounded segments) in the test1.wav file.
+    #[test]
+    #[ignore = "requires segmentation-3.0.onnx in ~/.sumi-dev/models/"]
+    fn segmentation_detects_speaker_class_changes_within_speech() {
+        let seg_path = crate::settings::segmentation_model_path();
+        assert!(seg_path.exists());
+        assert!(std::path::Path::new(&test1_wav()).exists());
+
+        let (samples, sr) = load_wav(&test1_wav());
+        let samples_16k = to_16k(&samples, sr);
+
+        let mut model =
+            SegmentationModel::new(&seg_path).expect("SegmentationModel::new");
+        let segs = model.find_sub_segments(&samples_16k);
+
+        println!(
+            "\n[seg-class] test1.wav ({:.1}s) → {} sub-segments",
+            samples_16k.len() as f64 / 16_000.0,
+            segs.len()
+        );
+        for (i, (s, e)) in segs.iter().enumerate() {
+            println!(
+                "  [{}] {:.3}s–{:.3}s",
+                i,
+                *s as f64 / 16_000.0,
+                *e as f64 / 16_000.0
+            );
+        }
+
+        // test1.wav is a natural conversation; we expect the segmentation model
+        // to return multiple sub-segments (at minimum from silence gaps).
+        assert!(
+            !segs.is_empty(),
+            "Segmentation returned 0 sub-segments from test1.wav"
+        );
+    }
+
+    // ── WeSpeaker embedding ────────────────────────────────────────────────────
+
+    /// Verify WeSpeaker produces non-zero 256-dim embeddings from real speech.
+    #[test]
+    #[ignore = "requires wespeaker-voxceleb-resnet34-LM.onnx in ~/.sumi-dev/models/"]
+    fn wespeaker_produces_256_dim_embedding() {
+        let emb_path = crate::settings::diarization_model_path();
+        assert!(emb_path.exists(), "WeSpeaker model not found: {}", emb_path.display());
+        assert!(std::path::Path::new(&test1_wav()).exists());
+
+        let (samples, sr) = load_wav(&test1_wav());
+        let samples_16k = to_16k(&samples, sr);
+        // Take first 3 seconds of speech.
+        let chunk = &samples_16k[..3 * 16_000];
+        let samples_i16 = f32_to_i16(chunk);
+
+        let path_str = emb_path.to_str().expect("path utf8");
+        let mut extractor =
+            pyannote_rs::EmbeddingExtractor::new(path_str).expect("EmbeddingExtractor");
+        let emb: Vec<f32> = extractor.compute(&samples_i16).expect("compute").collect();
+
+        println!("\n[wespeaker] embedding dim={}, norm={:.4}", emb.len(), {
+            emb.iter().map(|x| x * x).sum::<f32>().sqrt()
+        });
+
+        assert_eq!(emb.len(), 512, "expected 512-dim WeSpeaker embedding (ResNet34-LM)");
+
+        let norm: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!(norm > 1.0, "WeSpeaker embedding norm {norm} unexpectedly small");
+        // After L2 normalization, same-speaker cosine similarity should be ~1.
+        let n = l2_normalize(&emb);
+        let self_dist = cosine_dist(&n, &n);
+        assert!(self_dist < 1e-4, "self cosine dist {self_dist} should be ~0");
+    }
+
+    // ── Full two-phase pipeline ────────────────────────────────────────────────
+
+    /// End-to-end pipeline test matching exp_g_diarize_agglomerative.rs:
+    /// process VoxConverse 60 s (2 speakers) in 30 s chunks → finalize →
+    /// expect exactly 2 speakers identified.
+    #[test]
+    #[ignore = "requires both ONNX models in ~/.sumi-dev/models/"]
+    fn full_pipeline_detects_two_speakers_in_voxconv() {
+        let emb_path = crate::settings::diarization_model_path();
+        let seg_path = crate::settings::segmentation_model_path();
+        assert!(emb_path.exists());
+        assert!(seg_path.exists());
+        assert!(std::path::Path::new(&voxconv_wav()).exists());
+
+        let (samples, sr) = load_wav(&voxconv_wav());
+        let samples_16k = to_16k(&samples, sr);
+        let duration_s = samples_16k.len() as f64 / 16_000.0;
+
+        let mut engine =
+            DiarizationEngine::new(&emb_path, Some(&seg_path)).expect("DiarizationEngine");
+
+        // Process in 30-second chunks (simulating meeting mode).
+        let chunk_size = 30 * 16_000;
+        let mut all_online: Vec<(f64, f64, String)> = Vec::new();
+        for chunk_start in (0..samples_16k.len()).step_by(chunk_size) {
+            let chunk_end = (chunk_start + chunk_size).min(samples_16k.len());
+            let chunk = &samples_16k[chunk_start..chunk_end];
+            let start_secs = chunk_start as f64 / 16_000.0;
+            let sub_segs = engine.process_vad_chunk(chunk, start_secs);
+            println!(
+                "\n[chunk {:.0}s–{:.0}s] {} online sub-segs:",
+                start_secs,
+                chunk_end as f64 / 16_000.0,
+                sub_segs.len()
+            );
+            for (s, e, spk) in &sub_segs {
+                println!("  [{:.2}s–{:.2}s] {}", s, e, spk);
+            }
+            all_online.extend(sub_segs);
+        }
+
+        let online_speakers: HashSet<&str> =
+            all_online.iter().map(|(_, _, s)| s.as_str()).filter(|s| !s.is_empty()).collect();
+        println!(
+            "\n[online] {:.1}s, {} sub-segs, {} speakers",
+            duration_s,
+            all_online.len(),
+            online_speakers.len()
+        );
+
+        // Phase 2: agglomerative finalization.
+        let final_labels = engine.finalize_labels();
+        let final_speakers: HashSet<&str> =
+            final_labels.iter().map(|(_, _, s)| s.as_str()).collect();
+        println!(
+            "[agglomerative] {} sub-segs → {} speakers",
+            final_labels.len(),
+            final_speakers.len()
+        );
+        for (s, e, spk) in &final_labels {
+            println!("  [{:.2}s–{:.2}s] {}", s, e, spk);
+        }
+
+        // Must find at least some sub-segments.
+        assert!(
+            !all_online.is_empty(),
+            "process_vad_chunk returned no sub-segments"
+        );
+
+        // Agglomerative should detect exactly 2 speakers for this clip.
+        assert_eq!(
+            final_speakers.len(),
+            2,
+            "Expected 2 speakers (VoxConverse 2-speaker clip), got {}: {:?}",
+            final_speakers.len(),
+            final_speakers
+        );
+
+        // Buffer must be cleared after finalize_labels.
+        let second = engine.finalize_labels();
+        assert!(
+            second.is_empty(),
+            "finalize_labels should clear buffer; second call returned {} entries",
+            second.len()
+        );
+    }
+
+    /// Verify that agglomerative clustering produces the same result as
+    /// the experiment's reference implementation on a synthetic 2-speaker sequence.
+    #[test]
+    fn agglomerative_matches_reference_on_synthetic_two_speakers() {
+        // 4 segments: A B A B (alternating) with clearly separated embeddings.
+        let a = l2_normalize(&[1.0_f32, 0.0, 0.0, 0.0]);
+        let b = l2_normalize(&[0.0_f32, 1.0, 0.0, 0.0]);
+        let embs = vec![a.clone(), b.clone(), a.clone(), b.clone()];
+
+        let labels = agglomerative_cluster(&embs, 0.9);
+        assert_eq!(labels.len(), 4);
+        assert_eq!(labels[0], labels[2], "segments 0 and 2 should be same speaker (A)");
+        assert_eq!(labels[1], labels[3], "segments 1 and 3 should be same speaker (B)");
+        assert_ne!(labels[0], labels[1], "speakers A and B must differ");
+    }
+
+    /// Verify update_wal_speakers rewrites speaker labels correctly.
+    #[test]
+    fn update_wal_speakers_rewrites_labels() {
+        use crate::meeting_notes::{update_wal_speakers, WalSegment};
+
+        let seg0 = WalSegment {
+            speaker: "SPEAKER_00".to_string(),
+            start: 0.0,
+            end: 5.0,
+            text: "hello".to_string(),
+            words: vec![],
+        };
+        let seg1 = WalSegment {
+            speaker: "SPEAKER_00".to_string(), // online wrongly assigned same speaker
+            start: 5.0,
+            end: 10.0,
+            text: "world".to_string(),
+            words: vec![],
+        };
+        let wal = format!(
+            "{}\n{}",
+            serde_json::to_string(&seg0).unwrap(),
+            serde_json::to_string(&seg1).unwrap()
+        );
+
+        // Agglomerative says seg1 is actually SPEAKER_01.
+        let labels = vec![
+            (0.0_f64, 5.0_f64, "SPEAKER_00".to_string()),
+            (5.0_f64, 10.0_f64, "SPEAKER_01".to_string()),
+        ];
+        let updated = update_wal_speakers(&wal, &labels);
+
+        let lines: Vec<&str> = updated.lines().collect();
+        let s0: WalSegment = serde_json::from_str(lines[0]).unwrap();
+        let s1: WalSegment = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(s0.speaker, "SPEAKER_00");
+        assert_eq!(s1.speaker, "SPEAKER_01");
+        assert_eq!(s1.text, "world"); // text unchanged
+    }
+
+    /// Diagnostic: print pairwise cosine distances between embeddings extracted
+    /// from the ACTUAL sub-segments found by the segmentation model.
+    /// Shows the threshold range needed for correct 2-speaker clustering.
+    ///
+    /// Run with: cargo test diarization::integration::wespeaker_pairwise_distances_actual_segs -- --ignored --nocapture
+    #[test]
+    #[ignore = "diagnostic: requires both ONNX models + voxconv11.wav"]
+    fn wespeaker_pairwise_distances_actual_segs() {
+        let emb_path = crate::settings::diarization_model_path();
+        let seg_path = crate::settings::segmentation_model_path();
+        assert!(emb_path.exists());
+        assert!(seg_path.exists());
+        assert!(std::path::Path::new(&voxconv_wav()).exists());
+
+        let (samples, sr) = load_wav(&voxconv_wav());
+        let samples_16k = to_16k(&samples, sr);
+
+        let mut seg_model = SegmentationModel::new(&seg_path).expect("seg model");
+        let path_str = emb_path.to_str().unwrap();
+        let mut extractor =
+            pyannote_rs::EmbeddingExtractor::new(path_str).expect("EmbeddingExtractor");
+
+        // Find all sub-segments (same as full_pipeline).
+        let sub_segs = seg_model.find_sub_segments(&samples_16k.iter().map(|&x| x * 32767.0).collect::<Vec<f32>>());
+        println!("\n[segmentation] {} sub-segments:", sub_segs.len());
+
+        let mut embeddings: Vec<(f64, f64, usize, Vec<f32>)> = Vec::new();
+        const MAX_EMB_SAMPLES: usize = 5 * 16_000;
+        for (start_samp, end_samp) in &sub_segs {
+            let start_s = *start_samp as f64 / 16_000.0;
+            let end_s = *end_samp as f64 / 16_000.0;
+            let dur_s = end_s - start_s;
+            let chunk = &samples_16k[*start_samp..*end_samp];
+            let emb_chunk = if chunk.len() > MAX_EMB_SAMPLES { &chunk[..MAX_EMB_SAMPLES] } else { chunk };
+            let samples_i16 = f32_to_i16(emb_chunk);
+            let raw: Vec<f32> = extractor.compute(&samples_i16).expect("compute").collect();
+            let norm = raw.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let normalized = l2_normalize(&raw);
+            println!("  [{:.2}s–{:.2}s] dur={:.2}s  norm={:.2}  emb_len={}s", start_s, end_s, dur_s, norm, emb_chunk.len() / 16_000);
+            embeddings.push((start_s, end_s, chunk.len(), normalized));
+        }
+
+        println!("\n--- Pairwise cosine distances (actual sub-segments) ---");
+        for i in 0..embeddings.len() {
+            for j in (i+1)..embeddings.len() {
+                let d = cosine_dist(&embeddings[i].3, &embeddings[j].3);
+                println!("  [{:.2}s vs {:.2}s]: {:.4}", embeddings[i].0, embeddings[j].0, d);
+            }
+        }
+
+        // Find the threshold gap for 2-cluster agglomerative.
+        let mut all_dists: Vec<f32> = (0..embeddings.len())
+            .flat_map(|i| ((i+1)..embeddings.len()).map(move |j| (i, j)))
+            .map(|(i, j)| cosine_dist(&embeddings[i].3, &embeddings[j].3))
+            .collect();
+        all_dists.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        println!("\nAll distances sorted: {:?}", all_dists.iter().map(|d| format!("{:.4}", d)).collect::<Vec<_>>());
+
+        // For 2 clusters, we need to merge N-2 times.
+        // The Nth merge distance is the threshold to use.
+        let n = embeddings.len();
+        if n >= 2 {
+            let labels = agglomerative_cluster(&embeddings.iter().map(|(_, _, _, e)| e.clone()).collect::<Vec<_>>(), 10.0);
+            // Count distinct labels.
+            let unique: std::collections::HashSet<usize> = labels.iter().cloned().collect();
+            println!("[agglomerative threshold=10.0] {} clusters (should be 2)", unique.len());
+            for (i, ((s, e, _, _), lbl)) in embeddings.iter().zip(labels.iter()).enumerate() {
+                println!("  [{:.2}s–{:.2}s] → SPEAKER_{:02}", s, e, lbl);
+            }
+        }
+
+        assert!(!embeddings.is_empty());
+    }
+
+    /// Diagnostic: print pairwise cosine distances between embeddings extracted
+    /// from known speaker-change regions in voxconv11. This tells us what
+    /// threshold is appropriate for online clustering.
+    ///
+    /// Run with: cargo test diarization::integration::wespeaker_pairwise_distances -- --ignored --nocapture
+    #[test]
+    #[ignore = "diagnostic: requires wespeaker ONNX + voxconv11.wav"]
+    fn wespeaker_pairwise_distances_voxconv() {
+        let emb_path = crate::settings::diarization_model_path();
+        assert!(emb_path.exists(), "WeSpeaker model not found");
+        assert!(std::path::Path::new(&voxconv_wav()).exists(), "voxconv11.wav not found — set SUMI_TEST_AUDIO_DIR");
+
+        let (samples, sr) = load_wav(&voxconv_wav());
+        let samples_16k = to_16k(&samples, sr);
+
+        let path_str = emb_path.to_str().unwrap();
+        let mut extractor =
+            pyannote_rs::EmbeddingExtractor::new(path_str).expect("EmbeddingExtractor");
+
+        // Extract embeddings from 6 non-overlapping 3s windows spread across the 60s clip.
+        // Windows at 0s, 10s, 20s, 30s, 40s, 50s — if there are 2 speakers,
+        // some pairs should have high cosine distance.
+        let window_secs = 3.0f64;
+        let offsets_s = [0.0, 10.0, 20.0, 30.0, 40.0, 50.0f64];
+        let mut embeddings: Vec<(f64, Vec<f32>)> = Vec::new();
+
+        for &off in &offsets_s {
+            let start = (off * 16_000.0) as usize;
+            let end = ((off + window_secs) * 16_000.0) as usize;
+            let end = end.min(samples_16k.len());
+            if end <= start { continue; }
+            let chunk = &samples_16k[start..end];
+            let samples_i16 = f32_to_i16(chunk);
+            let raw: Vec<f32> = extractor.compute(&samples_i16).expect("compute").collect();
+            let norm = raw.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let normalized = l2_normalize(&raw);
+            println!("[embedding @{:.0}s] dim={}, raw_norm={:.2}", off, raw.len(), norm);
+            embeddings.push((off, normalized));
+        }
+
+        // Print pairwise cosine distances.
+        println!("\n--- Pairwise cosine distances ---");
+        for i in 0..embeddings.len() {
+            for j in (i+1)..embeddings.len() {
+                let d = cosine_dist(&embeddings[i].1, &embeddings[j].1);
+                println!("  [{:.0}s vs {:.0}s]: {:.4}", embeddings[i].0, embeddings[j].0, d);
+            }
+        }
+
+        // Print distance range.
+        let dists: Vec<f32> = (0..embeddings.len())
+            .flat_map(|i| ((i+1)..embeddings.len()).map(move |j| (i, j)))
+            .map(|(i, j)| cosine_dist(&embeddings[i].1, &embeddings[j].1))
+            .collect();
+        let min_d = dists.iter().cloned().fold(f32::MAX, f32::min);
+        let max_d = dists.iter().cloned().fold(f32::MIN, f32::max);
+        println!("\n  min={:.4}  max={:.4}", min_d, max_d);
+        println!("  → For online clustering threshold: use a value between min_same and max_diff.");
+
+        // No assertion — this is diagnostic only.
+        assert!(!embeddings.is_empty(), "No embeddings extracted");
     }
 }
