@@ -452,10 +452,21 @@ fn dtw_mode_for(model: &WhisperModel) -> DtwMode<'static> {
     }
 }
 
-/// Extract word-level timestamps from DTW token alignment after Whisper inference.
+/// Extract token-level timestamps from DTW alignment after Whisper inference.
 ///
 /// `audio_start_secs` is the start time of this audio chunk relative to the meeting start.
-/// Tokens are merged at word boundaries (space-prefix convention used by Whisper).
+///
+/// Each Whisper segment's text (correctly decoded via the segment-level API) is
+/// proportionally sliced across its valid-DTW tokens so that each token gets a
+/// character substring sized proportionally to `1/n_valid_tokens`.  This approach:
+///
+/// * Preserves correct text even for rare CJK characters encoded as byte-level BPE
+///   tokens (individual token strings from whisper-rs may be garbled for those).
+/// * Provides token-level timestamps so that diarization can assign sub-slices of
+///   text to the correct speaker sub-segment.
+/// * Works for both space-separated scripts (English) and CJK scripts (Chinese,
+///   Japanese, Korean) — no special-casing required.
+///
 /// Special tokens (`t_dtw == -1`) are skipped.
 pub fn extract_dtw_words(
     wh_state: &whisper_rs::WhisperState,
@@ -471,54 +482,49 @@ pub fn extract_dtw_words(
             continue;
         };
 
+        // Collect DTW timestamps for all valid tokens (t_dtw >= 0).
         let n_tokens = seg.n_tokens();
-        let mut word_text = String::new();
-        let mut word_start_cs: i64 = -1; // centiseconds from audio start
-        let mut word_end_cs: i64 = -1;
+        let valid_ts: Vec<i64> = (0..n_tokens)
+            .filter_map(|i| {
+                let tok = seg.get_token(i)?;
+                let td = tok.token_data();
+                if td.t_dtw < 0 { None } else { Some(td.t_dtw) }
+            })
+            .collect();
 
-        for tok_idx in 0..n_tokens {
-            let Some(token) = seg.get_token(tok_idx) else {
-                continue;
-            };
-            let td = token.token_data();
-            if td.t_dtw < 0 {
-                continue; // special token (BOS/EOS/SOT/…)
-            }
-
-            let tok_str = match token.to_str_lossy() {
-                Ok(s) => s.into_owned(),
-                Err(_) => continue,
-            };
-
-            // Whisper encodes word boundaries with a leading space.
-            // When a new word starts, flush the accumulated previous word.
-            if tok_str.starts_with(' ') && !word_text.is_empty() {
-                if word_start_cs >= 0 {
-                    words.push(WordTs {
-                        w: word_text.trim().to_string(),
-                        s: audio_start_secs + word_start_cs as f64 / 100.0,
-                        e: audio_start_secs + word_end_cs as f64 / 100.0,
-                    });
-                }
-                word_text = tok_str;
-                word_start_cs = td.t_dtw;
-                word_end_cs = td.t_dtw;
-            } else {
-                if word_start_cs < 0 {
-                    word_start_cs = td.t_dtw;
-                }
-                word_text.push_str(&tok_str);
-                word_end_cs = td.t_dtw;
-            }
+        if valid_ts.is_empty() {
+            continue;
         }
 
-        // Flush the final word of this segment.
-        if !word_text.is_empty() && word_start_cs >= 0 {
-            words.push(WordTs {
-                w: word_text.trim().to_string(),
-                s: audio_start_secs + word_start_cs as f64 / 100.0,
-                e: audio_start_secs + word_end_cs as f64 / 100.0,
-            });
+        // Use the segment-level text (correctly decoded, byte-BPE tokens reassembled).
+        let seg_text = match seg.to_str_lossy() {
+            Ok(s) => s.into_owned(),
+            Err(_) => continue,
+        };
+        let chars: Vec<char> = seg_text.chars().collect();
+        let n_chars = chars.len();
+        let n_valid = valid_ts.len();
+
+        if n_chars == 0 {
+            continue;
+        }
+
+        // Distribute character slices proportionally across tokens.
+        // Token i gets chars[i*n_chars/n_valid .. (i+1)*n_chars/n_valid].
+        // Consecutive tokens assigned to the same sub-segment will produce
+        // contiguous character slices that concatenate back to the original text.
+        for (pos, t_dtw) in valid_ts.iter().enumerate() {
+            let char_start = pos * n_chars / n_valid;
+            let char_end = ((pos + 1) * n_chars / n_valid).min(n_chars);
+            if char_start >= n_chars {
+                break;
+            }
+            let w: String = chars[char_start..char_end].iter().collect();
+            if w.trim().is_empty() {
+                continue;
+            }
+            let t = audio_start_secs + *t_dtw as f64 / 100.0;
+            words.push(WordTs { w, s: t, e: t });
         }
     }
 

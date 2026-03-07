@@ -418,13 +418,16 @@ pub(crate) fn run_whisper_meeting_feeder_loop(app: AppHandle, language: String, 
         let any_words = result.iter().any(|s| !s.words.is_empty());
         if any_words {
             for seg in &mut result {
+                // Each word.w is a proportional character slice of the original
+                // Whisper segment text.  Direct concatenation reconstructs the
+                // original text (spaces are embedded in the slices).
                 seg.text = seg
                     .words
                     .iter()
-                    .map(|w| w.w.trim())
-                    .filter(|w| !w.is_empty())
-                    .collect::<Vec<_>>()
-                    .join(" ");
+                    .map(|w| w.w.as_str())
+                    .collect::<String>()
+                    .trim()
+                    .to_string();
             }
         } else {
             // No word timestamps — assign full text to the longest sub-segment.

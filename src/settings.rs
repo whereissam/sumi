@@ -114,7 +114,7 @@ pub fn logs_dir() -> PathBuf {
 }
 
 pub fn diarization_model_path() -> PathBuf {
-    models_dir().join("wespeaker_en_voxceleb_CAM++.onnx")
+    models_dir().join("campplus_zh_cn_common_200k.onnx")
 }
 
 pub fn segmentation_model_path() -> PathBuf {

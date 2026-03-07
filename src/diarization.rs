@@ -1,4 +1,4 @@
-//! Speaker diarization: segmentation + WeSpeaker embeddings + clustering.
+//! Speaker diarization: segmentation + CAMPPlus embeddings + clustering.
 //!
 //! # Two-phase pipeline
 //!
@@ -7,7 +7,7 @@
 //! VAD chunk (f32, 16 kHz)
 //!   → SegmentationModel [1,1,N] → [1,T,7]  (speaker-class per frame)
 //!   → sub-segment boundaries (silence + speaker-class changes)
-//!   → WeSpeaker [1,T,80] → [1,512]  (per sub-segment; ResNet34-LM output dim)
+//!   → CAMPPlus [1,80,T] → [1,192]  (per sub-segment; CAMPPlus zh-cn-common embedding dim)
 //!   → L2 normalize
 //!   → online cosine clustering  (greedy, for real-time labels)
 //!   → "SPEAKER_00" / "SPEAKER_01" / …  +  embedding buffered for phase 2
@@ -16,7 +16,7 @@
 //! ## Finalization (at meeting stop, matches the experiment's quality)
 //! ```text
 //! buffered (start, end, embedding) for all sub-segments
-//!   → agglomerative hierarchical clustering (average linkage, threshold=0.50)
+//!   → agglomerative hierarchical clustering (average linkage, threshold=0.65)
 //!   → optimal speaker labels  (same algorithm as exp_g_diarize_agglomerative.rs)
 //!   → update WAL speaker fields before writing to SQLite
 //! ```
@@ -47,10 +47,12 @@ use ndarray::{Array1, ArrayViewD, Axis, IxDyn};
 pub const SEGMENTATION_URL: &str =
     "https://github.com/thewh1teagle/pyannote-rs/releases/download/v0.1.0/segmentation-3.0.onnx";
 
-/// WeSpeaker embedding model download URL (pyannote-rs v0.1.0 release).
-/// Filename uses CAM++ architecture; URL-encoded because `+` is special in URLs.
+/// CAMPPlus speaker embedding model download URL.
+/// Trained on CN-Celeb + CN Common (~200k speakers), 192-dim embeddings.
+/// Compatible with pyannote-rs EmbeddingExtractor (feats → embs, same tensor names).
+/// Exported from ModelScope damo/speech_campplus_sv_zh-cn_16k-common via ONNX opset 11.
 pub const WESPEAKER_URL: &str =
-    "https://github.com/thewh1teagle/pyannote-rs/releases/download/v0.1.0/wespeaker_en_voxceleb_CAM%2B%2B.onnx";
+    "https://huggingface.co/Alkd/campplus-zh-cn-common-200k-onnx/resolve/main/campplus_zh_cn_common_200k.onnx";
 
 // ── Segmentation model ─────────────────────────────────────────────────────────
 
@@ -237,8 +239,8 @@ impl SegmentationModel {
 /// Offline agglomerative hierarchical clustering (average linkage).
 ///
 /// Direct port from `exp_g_diarize_agglomerative.rs`.
-/// Threshold calibrated to 0.50 for `wespeaker_en_voxceleb_CAM++.onnx` with 5 s cap:
-/// same-speaker cosine distance ≤ 0.09, different-speaker > 0.51.
+/// Threshold calibrated to 0.65 for `campplus_zh_cn_common_200k.onnx` with 5 s cap:
+/// same-speaker cosine distance ≤ 0.45, different-speaker ≥ 0.69 (kkshow 3-spk Mandarin).
 ///
 /// Embeddings must already be L2-normalised before calling.
 /// Returns a cluster label (0-based) for each input embedding.
@@ -384,7 +386,7 @@ impl SpeakerClusters {
 
 // ── Diarization engine ─────────────────────────────────────────────────────────
 
-/// Combined diarization engine: segmentation + WeSpeaker + two-phase clustering.
+/// Combined diarization engine: segmentation + CAMPPlus embedding + two-phase clustering.
 pub struct DiarizationEngine {
     emb_extractor: pyannote_rs::EmbeddingExtractor,
     segmentation: Option<SegmentationModel>,
@@ -416,9 +418,9 @@ impl DiarizationEngine {
     pub fn new(emb_model: &Path, seg_model: Option<&Path>) -> Result<Self, String> {
         let path_str = emb_model
             .to_str()
-            .ok_or("WeSpeaker model path is not valid UTF-8")?;
+            .ok_or("CAMPPlus model path is not valid UTF-8")?;
         let emb_extractor = pyannote_rs::EmbeddingExtractor::new(path_str)
-            .map_err(|e| format!("Failed to load WeSpeaker model: {e}"))?;
+            .map_err(|e| format!("Failed to load CAMPPlus model: {e}"))?;
 
         let segmentation = seg_model
             .filter(|p| p.exists())
@@ -446,10 +448,11 @@ impl DiarizationEngine {
         Ok(Self {
             emb_extractor,
             segmentation,
-            // Threshold calibrated for wespeaker_en_voxceleb_CAM++.onnx + 5 s cap:
-            // same-speaker dist ≤ 0.09 (for comparable lengths), inter-speaker > 0.51.
-            // 0.50 cleanly separates speakers while tolerating short-segment noise.
-            clusters: SpeakerClusters::new(0.50),
+            // Threshold calibrated for campplus_zh_cn_common_200k.onnx + 5 s cap.
+            // Pairwise distance analysis on kkshow (3 spk, Mandarin):
+            //   same-speaker: 0.13–0.45  different-speaker: 0.69–0.89
+            // 0.65 sits safely in the gap; applies to both online and agglomerative.
+            clusters: SpeakerClusters::new(0.65),
             segment_buffer: Vec::new(),
         })
     }
@@ -458,7 +461,7 @@ impl DiarizationEngine {
     ///
     /// 1. If segmentation model available: split at silence AND speaker-class
     ///    changes → multiple sub-segments.
-    /// 2. For each sub-segment: WeSpeaker embedding → L2-normalise →
+    /// 2. For each sub-segment: CAMPPlus embedding → L2-normalise →
     ///    online cluster (immediate label) + buffer (for agglomerative pass).
     ///
     /// Returns `Vec<(start_secs, end_secs, speaker_label)>`.
@@ -487,8 +490,8 @@ impl DiarizationEngine {
 
         let mut result = Vec::new();
 
-        // WeSpeaker ResNet34-LM norms scale with segment duration: short segments
-        // have 10× larger pre-norm norms, making L2-normalised embeddings
+        // CAMPPlus norms scale with segment duration: short segments
+        // have larger pre-norm norms, making L2-normalised embeddings
         // incomparable across lengths.  Two mitigations:
         //   1. Cap embedding input to 5 s (normalises dynamic range).
         //   2. Segments < 1 s use `assign_nearest` (no centroid update, not buffered
@@ -602,7 +605,7 @@ impl DiarizationEngine {
             .map(|(_, _, emb)| emb.clone())
             .collect();
 
-        let labels = agglomerative_cluster(&embeddings, 0.50);
+        let labels = agglomerative_cluster(&embeddings, self.clusters.threshold);
 
         let result: Vec<(f64, f64, String)> = self
             .segment_buffer
@@ -636,7 +639,7 @@ impl DiarizationEngine {
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
-/// Convert f32 PCM [-1, 1] to i16 PCM (required by WeSpeaker extractor).
+/// Convert f32 PCM [-1, 1] to i16 PCM (required by pyannote-rs EmbeddingExtractor).
 pub fn f32_to_i16(samples: &[f32]) -> Vec<i16> {
     samples
         .iter()
@@ -829,8 +832,8 @@ mod tests {
 //
 // Models are loaded from the standard dev model directory
 // (~/.sumi-dev/models/).  Copy or symlink the ONNX files there before running:
-//   segmentation-3.0.onnx       (5.7 MB)
-//   wespeaker_en_voxceleb_CAM++.onnx  (28 MB)
+//   segmentation-3.0.onnx            (5.7 MB)
+//   campplus_zh_cn_common_200k.onnx  (28 MB)
 //
 // Test audio: set SUMI_TEST_AUDIO_DIR to a directory containing:
 //   voxconv11_60s.wav   (~60 s, 2-speaker clip, validated at DER=10.5%)
@@ -1076,14 +1079,14 @@ mod integration {
         );
     }
 
-    // ── WeSpeaker embedding ────────────────────────────────────────────────────
+    // ── CAMPPlus embedding ────────────────────────────────────────────────────
 
-    /// Verify WeSpeaker produces non-zero 512-dim embeddings from real speech.
+    /// Verify CAMPPlus produces non-zero 192-dim embeddings from real speech.
     #[test]
-    #[ignore = "requires wespeaker_en_voxceleb_CAM++.onnx in ~/.sumi-dev/models/"]
-    fn wespeaker_produces_512_dim_embedding() {
+    #[ignore = "requires campplus_zh_cn_common_200k.onnx in ~/.sumi-dev/models/"]
+    fn campplus_produces_192_dim_embedding() {
         let emb_path = crate::settings::diarization_model_path();
-        assert!(emb_path.exists(), "WeSpeaker model not found: {}", emb_path.display());
+        assert!(emb_path.exists(), "CAMPPlus model not found: {}", emb_path.display());
         assert!(std::path::Path::new(&test1_wav()).exists());
 
         let (samples, sr) = load_wav(&test1_wav());
@@ -1097,14 +1100,14 @@ mod integration {
             pyannote_rs::EmbeddingExtractor::new(path_str).expect("EmbeddingExtractor");
         let emb: Vec<f32> = extractor.compute(&samples_i16).expect("compute").collect();
 
-        println!("\n[wespeaker] embedding dim={}, norm={:.4}", emb.len(), {
+        println!("\n[campplus] embedding dim={}, norm={:.4}", emb.len(), {
             emb.iter().map(|x| x * x).sum::<f32>().sqrt()
         });
 
-        assert_eq!(emb.len(), 512, "expected 512-dim WeSpeaker embedding (ResNet34-LM)");
+        assert_eq!(emb.len(), 192, "expected 192-dim CAMPPlus embedding (zh-cn-common-200k)");
 
         let norm: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
-        assert!(norm > 1.0, "WeSpeaker embedding norm {norm} unexpectedly small");
+        assert!(norm > 1.0, "CAMPPlus embedding norm {norm} unexpectedly small");
         // After L2 normalization, same-speaker cosine similarity should be ~1.
         let n = l2_normalize(&emb);
         let self_dist = cosine_dist(&n, &n);
@@ -1320,7 +1323,7 @@ mod integration {
             // Count distinct labels.
             let unique: std::collections::HashSet<usize> = labels.iter().cloned().collect();
             println!("[agglomerative threshold=10.0] {} clusters (should be 2)", unique.len());
-            for (i, ((s, e, _, _), lbl)) in embeddings.iter().zip(labels.iter()).enumerate() {
+            for ((s, e, _, _), lbl) in embeddings.iter().zip(labels.iter()) {
                 println!("  [{:.2}s–{:.2}s] → SPEAKER_{:02}", s, e, lbl);
             }
         }
@@ -1390,4 +1393,229 @@ mod integration {
         // No assertion — this is diagnostic only.
         assert!(!embeddings.is_empty(), "No embeddings extracted");
     }
+
+    /// Full Whisper + diarization transcript for kkshow.m4a (3-speaker, ~36s).
+    ///
+    /// Run with:
+    ///   cargo test diarization::integration::kkshow_full_transcript -- --ignored --nocapture
+    ///
+    /// Pre-requisites:
+    ///   ffmpeg -i ~/Desktop/kkshow.m4a -ar 16000 -ac 1 /tmp/kkshow_16k.wav
+    ///   ONNX models in ~/.sumi-dev/models/
+    ///   Whisper model: ~/.sumi-dev/models/ggml-large-v3-turbo-q5_0.bin
+    #[test]
+    #[ignore = "integration: requires ONNX models + /tmp/kkshow_16k.wav + Whisper model"]
+    fn kkshow_full_transcript() {
+        use whisper_rs::{
+            DtwMode, DtwModelPreset, DtwParameters, FullParams, SamplingStrategy,
+            WhisperContext, WhisperContextParameters,
+        };
+
+        let emb_path = crate::settings::diarization_model_path();
+        let seg_path = crate::settings::segmentation_model_path();
+        let model_path = std::path::PathBuf::from(std::env::var("HOME").unwrap())
+            .join(".sumi-dev/models/ggml-large-v3-turbo-q5_0.bin");
+
+        assert!(emb_path.exists(), "WeSpeaker model not found: {}", emb_path.display());
+        assert!(seg_path.exists(), "Segmentation model not found: {}", seg_path.display());
+        assert!(model_path.exists(), "Whisper model not found: {}", model_path.display());
+        assert!(
+            std::path::Path::new("/tmp/kkshow_16k.wav").exists(),
+            "/tmp/kkshow_16k.wav missing — run: ffmpeg -i ~/Desktop/kkshow.m4a -ar 16000 -ac 1 /tmp/kkshow_16k.wav"
+        );
+
+        // Load audio.
+        let (samples_raw, sr) = load_wav("/tmp/kkshow_16k.wav");
+        let samples = to_16k(&samples_raw, sr);
+        let duration_s = samples.len() as f64 / 16_000.0;
+        println!("\n[kkshow] {:.1}s audio loaded ({} samples @ 16 kHz)", duration_s, samples.len());
+
+        // Initialize DiarizationEngine (segmentation + WeSpeaker embedding).
+        let mut engine =
+            DiarizationEngine::new(&emb_path, Some(&seg_path)).expect("DiarizationEngine::new");
+
+        // Initialize Whisper with DTW word timestamps.
+        let mut ctx_params = WhisperContextParameters::default();
+        ctx_params.dtw_parameters = DtwParameters {
+            mode: DtwMode::ModelPreset { model_preset: DtwModelPreset::LargeV3Turbo },
+            dtw_mem_size: 128 * 1024 * 1024,
+            ..Default::default()
+        };
+        let ctx = WhisperContext::new_with_params(model_path.to_str().unwrap(), ctx_params)
+            .expect("WhisperContext::new_with_params");
+
+        struct SegResult {
+            start: f64,
+            end: f64,
+            speaker: String, // online label, updated by agglomerative pass
+            text: String,
+        }
+
+        let mut all_results: Vec<SegResult> = Vec::new();
+        let mut prev_text = String::new();
+        const CHUNK_SAMPLES: usize = 30 * 16_000;
+
+        let mut offset = 0;
+        while offset < samples.len() {
+            let chunk_end = (offset + CHUNK_SAMPLES).min(samples.len());
+            let chunk = &samples[offset..chunk_end];
+            let chunk_start_secs = offset as f64 / 16_000.0;
+
+            // Phase 1a: diarization sub-segments.
+            let sub_segs = engine.process_vad_chunk(chunk, chunk_start_secs);
+
+            // Phase 1b: Whisper transcription + DTW word timestamps.
+            let mut state = ctx.create_state().expect("create_state");
+            {
+                let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+                params.set_language(Some("zh"));
+                if !prev_text.is_empty() {
+                    params.set_initial_prompt(&prev_text);
+                }
+                params.set_print_special(false);
+                params.set_print_realtime(false);
+                params.set_print_progress(false);
+                params.set_single_segment(false);
+                params.set_no_timestamps(true);
+                params.set_no_context(true);
+                params.set_temperature_inc(0.6);
+                params.set_no_speech_thold(0.5);
+                state.full(params, chunk).expect("whisper full");
+            }
+
+            // Collect raw text.
+            let mut full_text = String::new();
+            for i in 0..state.full_n_segments() {
+                if let Some(seg) = state.get_segment(i) {
+                    if seg.no_speech_probability() > 0.5 {
+                        continue;
+                    }
+                    if let Ok(s) = seg.to_str_lossy() {
+                        full_text.push_str(&s);
+                    }
+                }
+            }
+            let full_text = full_text.trim().to_string();
+
+            // DTW word timestamps.
+            let words = crate::transcribe::extract_dtw_words(&state, chunk_start_secs);
+
+            // Update context for next chunk.
+            if !full_text.is_empty() {
+                let chars: Vec<char> = full_text.chars().collect();
+                let take = chars.len().min(200);
+                prev_text = chars[chars.len() - take..].iter().collect();
+            }
+
+            let preview: String = full_text.chars().take(30).collect();
+            println!(
+                "[chunk {:.0}s–{:.0}s] {} sub-segs, {} dtw-words, text={}",
+                chunk_start_secs,
+                chunk_end as f64 / 16_000.0,
+                sub_segs.len(),
+                words.len(),
+                preview,
+            );
+
+            if sub_segs.is_empty() {
+                // No diarization data: emit as a single unspeakered segment.
+                if !full_text.is_empty() {
+                    all_results.push(SegResult {
+                        start: chunk_start_secs,
+                        end: chunk_end as f64 / 16_000.0,
+                        speaker: String::new(),
+                        text: full_text,
+                    });
+                }
+            } else {
+                // Assign words to sub-segments by absolute timestamp.
+                let mut seg_texts: Vec<String> = vec![String::new(); sub_segs.len()];
+
+                if words.is_empty() {
+                    // No DTW words: give full text to the longest sub-segment.
+                    if let Some(longest_idx) = sub_segs
+                        .iter()
+                        .enumerate()
+                        .max_by(|a, b| {
+                            (a.1.1 - a.1.0)
+                                .partial_cmp(&(b.1.1 - b.1.0))
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                        .map(|(i, _)| i)
+                    {
+                        seg_texts[longest_idx] = full_text.clone();
+                    }
+                } else {
+                    for word in &words {
+                        let idx = sub_segs
+                            .iter()
+                            .position(|(s, e, _)| word.s >= *s && word.s < *e)
+                            .unwrap_or(sub_segs.len() - 1);
+                        // Append token as-is: leading space already encodes the
+                        // word boundary for Latin scripts; CJK tokens have none.
+                        seg_texts[idx].push_str(&word.w);
+                    }
+                    // Trim leading/trailing whitespace from each segment's text.
+                    for t in &mut seg_texts {
+                        let trimmed = t.trim().to_string();
+                        *t = trimmed;
+                    }
+                }
+
+                for ((start, end, speaker), text) in sub_segs.iter().zip(seg_texts.into_iter()) {
+                    all_results.push(SegResult {
+                        start: *start,
+                        end: *end,
+                        speaker: speaker.clone(),
+                        text,
+                    });
+                }
+            }
+
+            offset += CHUNK_SAMPLES;
+        }
+
+        // Phase 2: agglomerative relabeling — update online speaker labels.
+        let final_labels = engine.finalize_labels();
+        if !final_labels.is_empty() {
+            for r in &mut all_results {
+                if let Some((_, _, new_spk)) = final_labels
+                    .iter()
+                    .find(|(s, e, _)| (r.start - s).abs() < 0.05 && (r.end - e).abs() < 0.05)
+                {
+                    r.speaker = new_spk.clone();
+                }
+            }
+        }
+
+        // Print the final labeled transcript.
+        let fmt_time = |secs: f64| -> String {
+            let m = secs as u64 / 60;
+            let s = secs as u64 % 60;
+            format!("{}:{:02}", m, s)
+        };
+        let fmt_spk = |spk: &str| -> String {
+            if let Some(n) = spk.strip_prefix("SPEAKER_") {
+                format!("Speaker {}", n.parse::<u32>().unwrap_or(0) + 1)
+            } else {
+                spk.to_string()
+            }
+        };
+
+        println!("\n=== kkshow 完整逐字稿（帶說話者）===");
+        for r in &all_results {
+            if r.text.is_empty() {
+                continue;
+            }
+            if r.speaker.is_empty() {
+                println!("[{}] {}", fmt_time(r.start), r.text);
+            } else {
+                println!("[{}] {}: {}", fmt_time(r.start), fmt_spk(&r.speaker), r.text);
+            }
+        }
+        println!("=== end ({} segments) ===", all_results.iter().filter(|r| !r.text.is_empty()).count());
+
+        assert!(!all_results.is_empty(), "No results produced");
+    }
+
 }
