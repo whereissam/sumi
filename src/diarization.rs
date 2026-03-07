@@ -16,7 +16,7 @@
 //! ## Finalization (at meeting stop, matches the experiment's quality)
 //! ```text
 //! buffered (start, end, embedding) for all sub-segments
-//!   → agglomerative hierarchical clustering (average linkage, threshold=0.9)
+//!   → agglomerative hierarchical clustering (average linkage, threshold=0.50)
 //!   → optimal speaker labels  (same algorithm as exp_g_diarize_agglomerative.rs)
 //!   → update WAL speaker fields before writing to SQLite
 //! ```
