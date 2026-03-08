@@ -373,7 +373,7 @@
   "settings.behavior": "行为",
   "settings.behavior.autoPaste": "自动粘贴",
   "settings.behavior.autoPasteDesc": "自动将转录文字粘贴到光标位置",
-  "settings.behavior.micIdle": "减少背景音频干扰",
+  "settings.behavior.micIdle": "闲置关闭麦克风",
   "settings.behavior.micIdleDesc": "闲置时自动关闭麦克风，避免系统音频闪避",
   "settings.behavior.micIdle.off": "关闭",
   "settings.behavior.micIdle.30s": "30 秒",

@@ -346,7 +346,7 @@
   "settings.behavior": "ನಡವಳಿಕೆ",
   "settings.behavior.autoPaste": "ಸ್ವಯಂ-ಅಂಟಿಸು",
   "settings.behavior.autoPasteDesc": "ಕರ್ಸರ್ ಸ್ಥಾನದಲ್ಲಿ ಸ್ವಯಂಚಾಲಿತವಾಗಿ ಪ್ರತಿಲಿಪಿ ಅಂಟಿಸಿ",
-  "settings.behavior.micIdle": "Reduce background audio interference",
+  "settings.behavior.micIdle": "Close mic when idle",
   "settings.behavior.micIdleDesc": "Close mic after idle to prevent audio ducking",
   "settings.behavior.micIdle.off": "Off",
   "settings.behavior.micIdle.30s": "30 seconds",

@@ -346,7 +346,7 @@
   "settings.behavior": "Vedenje",
   "settings.behavior.autoPaste": "Samodejno lepljenje",
   "settings.behavior.autoPasteDesc": "Samodejno prilepite transkripcijo na položaj kazalca",
-  "settings.behavior.micIdle": "Reduce background audio interference",
+  "settings.behavior.micIdle": "Close mic when idle",
   "settings.behavior.micIdleDesc": "Close mic after idle to prevent audio ducking",
   "settings.behavior.micIdle.off": "Off",
   "settings.behavior.micIdle.30s": "30 seconds",

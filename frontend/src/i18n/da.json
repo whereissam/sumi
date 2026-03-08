@@ -346,7 +346,7 @@
   "settings.behavior": "Opførsel",
   "settings.behavior.autoPaste": "Auto-indsætning",
   "settings.behavior.autoPasteDesc": "Indsæt automatisk transskription på markørposition",
-  "settings.behavior.micIdle": "Reduce background audio interference",
+  "settings.behavior.micIdle": "Close mic when idle",
   "settings.behavior.micIdleDesc": "Close mic after idle to prevent audio ducking",
   "settings.behavior.micIdle.off": "Off",
   "settings.behavior.micIdle.30s": "30 seconds",

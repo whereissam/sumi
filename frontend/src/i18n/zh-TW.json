@@ -373,7 +373,7 @@
   "settings.behavior": "行為",
   "settings.behavior.autoPaste": "自動貼上",
   "settings.behavior.autoPasteDesc": "自動將轉錄文字貼上至游標位置",
-  "settings.behavior.micIdle": "減少背景音訊干擾",
+  "settings.behavior.micIdle": "閒置關閉麥克風",
   "settings.behavior.micIdleDesc": "閒置時自動關閉麥克風，避免系統音訊閃避",
   "settings.behavior.micIdle.off": "關閉",
   "settings.behavior.micIdle.30s": "30 秒",
