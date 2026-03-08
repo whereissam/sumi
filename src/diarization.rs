@@ -1833,7 +1833,7 @@ fn pyannote_diarize_import(
         }
     }
     tracing::info!(
-        "[diarize] import mode: {} windows (step=2.5s), {} embeddings (slot0={}, slot1={}, slot2={})",
+        "[diarize] import mode: {} windows (step=1.0s), {} embeddings (slot0={}, slot1={}, slot2={})",
         num_windows,
         emb_count,
         slot_counts[0],

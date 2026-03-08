@@ -14,62 +14,7 @@ Outputs vbx_crossval.json with:
 import json
 import numpy as np
 from scipy.special import softmax
-
-# Load real PLDA params
-import os
-from huggingface_hub import hf_hub_download
-
-token = os.environ.get("HF_TOKEN", None)
-repo_id = "pyannote/speaker-diarization-community-1"
-xvec_path = hf_hub_download(repo_id, "xvec_transform.npz", subfolder="plda", token=token)
-plda_path = hf_hub_download(repo_id, "plda.npz", subfolder="plda", token=token)
-
-xvec_data = np.load(xvec_path)
-plda_data = np.load(plda_path)
-
-mean1 = xvec_data["mean1"].astype(np.float64).ravel()
-mean2 = xvec_data["mean2"].astype(np.float64).ravel()
-lda = xvec_data["lda"].astype(np.float64)
-
-d_in = lda.shape[0]
-d_out = lda.shape[1]
-
-mu = plda_data["mu"].astype(np.float64).ravel()
-tr = plda_data["tr"].astype(np.float64)
-psi = plda_data["psi"].astype(np.float64).ravel()
-
 from scipy.linalg import eigh
-W = np.linalg.inv(tr.T @ tr)
-B = np.linalg.inv((tr.T / psi) @ tr)
-acvar, wccn = eigh(B, W)
-plda_psi = acvar[::-1]
-plda_tr_mat = wccn.T[::-1]
-
-phi = plda_psi[:d_out]
-
-print(f"d_in={d_in}, d_out={d_out}")
-print(f"phi range: [{phi.min():.6f}, {phi.max():.6f}]")
-
-
-def xvec_transform(emb):
-    """Apply xvec_tf (same as pyannote's vbx_setup lambda)."""
-    x = emb - mean1
-    x = x / np.linalg.norm(x)
-    x = np.sqrt(d_in) * x
-    x = x @ lda
-    x = x - mean2
-    x = x / np.linalg.norm(x)
-    x = np.sqrt(d_out) * x
-    return x
-
-
-def plda_transform(x):
-    """Apply plda_tf (same as pyannote's vbx_setup lambda)."""
-    return (x - mu) @ plda_tr_mat[:d_out, :d_out].T
-
-
-def full_transform(emb):
-    return plda_transform(xvec_transform(emb))
 
 
 def vbx_reference(features, phi, init_labels, k, fa=0.07, fb=0.8,
@@ -114,59 +59,115 @@ def vbx_reference(features, phi, init_labels, k, fa=0.07, fb=0.8,
     return gamma, pi
 
 
-# Generate test embeddings: two speakers with distinct directions
-np.random.seed(42)
+def main():
+    import os
+    from huggingface_hub import hf_hub_download
 
-# Speaker A: dominant in first 128 dims
-raw_A = np.random.randn(5, d_in).astype(np.float64) * 0.3
-raw_A[:, :128] += 1.0  # bias first half
+    token = os.environ.get("HF_TOKEN", None)
+    repo_id = "pyannote/speaker-diarization-community-1"
+    xvec_path = hf_hub_download(repo_id, "xvec_transform.npz", subfolder="plda", token=token)
+    plda_path = hf_hub_download(repo_id, "plda.npz", subfolder="plda", token=token)
 
-# Speaker B: dominant in last 128 dims
-raw_B = np.random.randn(5, d_in).astype(np.float64) * 0.3
-raw_B[:, 128:] += 1.0  # bias second half
+    xvec_data = np.load(xvec_path)
+    plda_data = np.load(plda_path)
 
-raw_embs = np.vstack([raw_A, raw_B])
-print(f"\nRaw embeddings: shape={raw_embs.shape}")
+    mean1 = xvec_data["mean1"].astype(np.float64).ravel()
+    mean2 = xvec_data["mean2"].astype(np.float64).ravel()
+    lda = xvec_data["lda"].astype(np.float64)
 
-# Transform all embeddings
-transformed = np.array([full_transform(e) for e in raw_embs])
-print(f"Transformed: shape={transformed.shape}")
-print(f"  norms: {np.linalg.norm(transformed, axis=1)}")
+    d_in = lda.shape[0]
+    d_out = lda.shape[1]
 
-# AHC initialization (simulate: first 5 = cluster 0, last 5 = cluster 1)
-# In practice we'd use cosine AHC, but for cross-validation we use known labels
-init_labels = np.array([0] * 5 + [1] * 5)
-k = 2
+    mu = plda_data["mu"].astype(np.float64).ravel()
+    tr = plda_data["tr"].astype(np.float64)
+    psi = plda_data["psi"].astype(np.float64).ravel()
 
-print("\n=== VBx with pyannote defaults (Fa=0.07, Fb=0.8) ===")
-gamma, pi_arr = vbx_reference(transformed, phi, init_labels, k, fa=0.07, fb=0.8)
+    W = np.linalg.inv(tr.T @ tr)
+    B = np.linalg.inv((tr.T / psi) @ tr)
+    acvar, wccn = eigh(B, W)
+    plda_psi = acvar[::-1]
+    plda_tr_mat = wccn.T[::-1]
 
-print(f"  pi = {pi_arr}")
-for i in range(10):
-    assigned = np.argmax(gamma[i])
-    print(f"  emb {i}: cluster {assigned} (γ={gamma[i, assigned]:.6f})")
+    phi = plda_psi[:d_out]
 
-# Also test xvec_transform alone (for Rust cross-validation)
-xvec_results = np.array([xvec_transform(e) for e in raw_embs])
+    print(f"d_in={d_in}, d_out={d_out}")
+    print(f"phi range: [{phi.min():.6f}, {phi.max():.6f}]")
 
-# Export
-data = {
-    "d_in": int(d_in),
-    "d_out": int(d_out),
-    "raw_embeddings": raw_embs.tolist(),
-    "xvec_transformed": xvec_results.tolist(),
-    "plda_transformed": transformed.tolist(),
-    "init_labels": init_labels.tolist(),
-    "k": k,
-    "fa": 0.07,
-    "fb": 0.8,
-    "gamma": gamma.tolist(),
-    "pi": pi_arr.tolist(),
-    "phi_first8": phi[:8].tolist(),
-}
+    def xvec_transform(emb):
+        """Apply xvec_tf (same as pyannote's vbx_setup lambda)."""
+        x = emb - mean1
+        x = x / np.linalg.norm(x)
+        x = np.sqrt(d_in) * x
+        x = x @ lda
+        x = x - mean2
+        x = x / np.linalg.norm(x)
+        x = np.sqrt(d_out) * x
+        return x
 
-with open("vbx_crossval.json", "w") as f:
-    json.dump(data, f, indent=2)
+    def plda_transform(x):
+        """Apply plda_tf (same as pyannote's vbx_setup lambda)."""
+        return (x - mu) @ plda_tr_mat[:d_out, :d_out].T
 
-print(f"\nWrote vbx_crossval.json")
-print(f"  phi[:8] = {phi[:8]}")
+    def full_transform(emb):
+        return plda_transform(xvec_transform(emb))
+
+    # Generate test embeddings: two speakers with distinct directions
+    np.random.seed(42)
+
+    # Speaker A: dominant in first 128 dims
+    raw_A = np.random.randn(5, d_in).astype(np.float64) * 0.3
+    raw_A[:, :128] += 1.0  # bias first half
+
+    # Speaker B: dominant in last 128 dims
+    raw_B = np.random.randn(5, d_in).astype(np.float64) * 0.3
+    raw_B[:, 128:] += 1.0  # bias second half
+
+    raw_embs = np.vstack([raw_A, raw_B])
+    print(f"\nRaw embeddings: shape={raw_embs.shape}")
+
+    # Transform all embeddings
+    transformed = np.array([full_transform(e) for e in raw_embs])
+    print(f"Transformed: shape={transformed.shape}")
+    print(f"  norms: {np.linalg.norm(transformed, axis=1)}")
+
+    # AHC initialization (simulate: first 5 = cluster 0, last 5 = cluster 1)
+    # In practice we'd use cosine AHC, but for cross-validation we use known labels
+    init_labels = np.array([0] * 5 + [1] * 5)
+    k = 2
+
+    print("\n=== VBx with pyannote defaults (Fa=0.07, Fb=0.8) ===")
+    gamma, pi_arr = vbx_reference(transformed, phi, init_labels, k, fa=0.07, fb=0.8)
+
+    print(f"  pi = {pi_arr}")
+    for i in range(10):
+        assigned = np.argmax(gamma[i])
+        print(f"  emb {i}: cluster {assigned} (γ={gamma[i, assigned]:.6f})")
+
+    # Also test xvec_transform alone (for Rust cross-validation)
+    xvec_results = np.array([xvec_transform(e) for e in raw_embs])
+
+    # Export
+    data = {
+        "d_in": int(d_in),
+        "d_out": int(d_out),
+        "raw_embeddings": raw_embs.tolist(),
+        "xvec_transformed": xvec_results.tolist(),
+        "plda_transformed": transformed.tolist(),
+        "init_labels": init_labels.tolist(),
+        "k": k,
+        "fa": 0.07,
+        "fb": 0.8,
+        "gamma": gamma.tolist(),
+        "pi": pi_arr.tolist(),
+        "phi_first8": phi[:8].tolist(),
+    }
+
+    with open("vbx_crossval.json", "w") as f:
+        json.dump(data, f, indent=2)
+
+    print(f"\nWrote vbx_crossval.json")
+    print(f"  phi[:8] = {phi[:8]}")
+
+
+if __name__ == "__main__":
+    main()

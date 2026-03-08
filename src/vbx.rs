@@ -74,6 +74,9 @@ impl PldaParams {
         // d_in, d_out
         let d_in = read_u32(&data, &mut cursor)? as usize;
         let d_out = read_u32(&data, &mut cursor)? as usize;
+        if d_in == 0 || d_out == 0 || d_out > d_in || d_in > 4096 {
+            return Err(format!("plda.bin: invalid dimensions d_in={d_in} d_out={d_out}"));
+        }
 
         let mean1 = read_f32_vec(&data, &mut cursor, d_in)?;
         let mean2 = read_f32_vec(&data, &mut cursor, d_out)?;
@@ -349,26 +352,21 @@ pub(crate) fn vbx_cluster(
         centroids.push(centroid);
     }
 
-    let mut num_clusters = centroids.len();
-
     // 7. K-Means override if outside bounds
     let min_k = min_speakers.unwrap_or(1);
     let max_k = max_speakers.unwrap_or(usize::MAX);
-    if num_clusters < min_k || num_clusters > max_k {
-        let target = num_clusters.clamp(min_k, max_k);
+    if centroids.len() < min_k || centroids.len() > max_k {
+        let target = centroids.len().clamp(min_k, max_k);
         tracing::debug!(
             "[vbx] K-Means override: {} → {} clusters ([{}, {}])",
-            num_clusters,
+            centroids.len(),
             target,
             min_k,
             max_k
         );
         let km_labels = kmeans(&normed, target, 3, 100, 42);
         centroids = compute_kmeans_centroids(raw_embeddings, &km_labels, target);
-        num_clusters = target;
     }
-
-    let _ = num_clusters; // used only for logging above
 
     // 8. Assign all embeddings to nearest centroid (cosine distance)
     raw_embeddings
@@ -763,6 +761,9 @@ fn sq_euclidean_f64(a: &[f32], b: &[f32]) -> f64 {
 
 /// Simple xorshift64 PRNG (deterministic, matching random_state=42).
 fn simple_rng(state: &mut u64) -> u64 {
+    if *state == 0 {
+        *state = 0xdeadbeef_cafebabe;
+    }
     let mut x = *state;
     x ^= x << 13;
     x ^= x >> 7;
