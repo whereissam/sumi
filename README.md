@@ -72,7 +72,7 @@ Meeting mode transcribes continuously in the background. Transcripts are labelle
 <td width="50%" valign="top">
 
 ### ✏️ Edit by Voice
-Select any text, press `Ctrl+Option+Z`, say what you want done. "Make this more formal." "Translate to Japanese." "Shorten it." The AI rewrites and pastes back.
+Select any text, press `Option+E`, say what you want done. "Make this more formal." "Translate to Japanese." "Shorten it." The AI rewrites and pastes back.
 
 </td>
 </tr>
@@ -119,12 +119,12 @@ The interface ships in 58 locales. Traditional Chinese users get automatic zh-CN
 
 1. App lives in the menu bar — nothing else on screen.
 2. Click into any text field, anywhere on your Mac.
-3. Press `Option+Z`. A floating capsule appears with the waveform.
+3. Press `Option+V`. A floating capsule appears with the waveform.
 4. Speak.
-5. Press `Option+Z` again. Text pastes.
+5. Press `Option+V` again. Text pastes.
 
-**Edit by Voice:** select text → `Ctrl+Option+Z` → say what to do with it.
-**Meeting Mode:** separate hotkey toggles continuous background transcription into a note file.
+**Edit by Voice:** select text → `Option+E` → say what to do with it.
+**Meeting Mode:** press `Option+M` to toggle continuous background transcription into a note file.
 
 ---
 
