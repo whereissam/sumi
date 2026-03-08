@@ -744,11 +744,27 @@
           {/if}
         </div>
         <div class="test-right">
-          {#if polishReady}
-            <svg width="80" height="80" viewBox="0 0 24 24" fill="none" stroke="#28c840" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
-          {:else}
-            <svg width="80" height="80" viewBox="0 0 24 24" fill="none" stroke="#ff9500" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
-          {/if}
+          <div class="test-polish-demo">
+            <div class="test-polish-demo-raw">
+              <div class="test-polish-demo-badge">
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="2" width="6" height="11" rx="3"/><path d="M5 10a7 7 0 0 0 14 0"/><line x1="12" y1="19" x2="12" y2="22"/></svg>
+                <span>Raw</span>
+              </div>
+              <p>"um yeah so I was thinking — maybe we could like, have lunch tomorrow?"</p>
+            </div>
+            <div class="test-polish-demo-divider">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#007AFF" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
+              <span>AI Polish</span>
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#007AFF" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><polyline points="19 12 12 19 5 12"/></svg>
+            </div>
+            <div class="test-polish-demo-polished">
+              <div class="test-polish-demo-badge polished">
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
+                <span>Polished</span>
+              </div>
+              <p>"I was thinking we could have lunch tomorrow."</p>
+            </div>
+          </div>
         </div>
       </div>
     </div>
@@ -1377,6 +1393,71 @@
     border-bottom-color: rgba(0, 0, 0, 0.18);
     color: var(--accent-blue);
     font-weight: 700;
+  }
+
+  /* ── Polish before/after demo card ── */
+  .test-polish-demo {
+    background: #fff;
+    border-radius: 12px;
+    box-shadow: 0 2px 16px rgba(0, 0, 0, 0.08), 0 0 0 1px rgba(0, 0, 0, 0.05);
+    width: 84%;
+    max-width: 320px;
+    overflow: hidden;
+  }
+
+  .test-polish-demo-raw {
+    padding: 14px 16px;
+    background: #f8f8f8;
+  }
+
+  .test-polish-demo-polished {
+    padding: 14px 16px;
+  }
+
+  .test-polish-demo-badge {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    margin-bottom: 7px;
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-tertiary);
+  }
+
+  .test-polish-demo-badge.polished {
+    color: #007AFF;
+  }
+
+  .test-polish-demo-raw p {
+    margin: 0;
+    font-size: 13px;
+    color: var(--text-tertiary);
+    line-height: 1.5;
+    font-style: italic;
+  }
+
+  .test-polish-demo-polished p {
+    margin: 0;
+    font-size: 13px;
+    color: var(--text-primary);
+    line-height: 1.5;
+    font-weight: 500;
+  }
+
+  .test-polish-demo-divider {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    padding: 7px 16px;
+    background: rgba(0, 122, 255, 0.05);
+    border-top: 1px solid rgba(0, 122, 255, 0.1);
+    border-bottom: 1px solid rgba(0, 122, 255, 0.1);
+    font-size: 11px;
+    font-weight: 600;
+    color: #007AFF;
   }
 
   /* ── Polish status ── */
