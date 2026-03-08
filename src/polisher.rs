@@ -142,9 +142,14 @@ pub enum PolishModel {
     Phi4Mm,
     #[serde(rename = "ministral3b")]
     Ministral3B,
+    #[serde(rename = "ministral14b")]
+    #[serde(alias = "ministral8b")]
+    Ministral14B,
     #[serde(rename = "qwen3_4b")]
     #[serde(alias = "qwen35_4b")]
     Qwen3_4B,
+    #[serde(rename = "qwen3_8b")]
+    Qwen3_8B,
     /// Catch-all for settings that contain old model names (llama_taiwan, qwen25, qwen3, qwen3_0_6b).
     /// Will be migrated to a language-appropriate default on next load.
     #[serde(other)]
@@ -157,7 +162,9 @@ impl PolishModel {
         match self {
             PolishModel::Phi4Mm => "Phi-4-mini-instruct-Q4_K_M.gguf",
             PolishModel::Ministral3B => "Ministral-3-3B-Instruct-2512-Q4_K_M.gguf",
+            PolishModel::Ministral14B => "Ministral-3-14B-Instruct-2512-Q4_K_M.gguf",
             PolishModel::Qwen3_4B => "Qwen3-4B-Q4_K_M.gguf",
+            PolishModel::Qwen3_8B => "Qwen3-8B-Q4_K_M.gguf",
             PolishModel::Unknown => "Phi-4-mini-instruct-Q4_K_M.gguf",
         }
     }
@@ -170,8 +177,14 @@ impl PolishModel {
             PolishModel::Ministral3B => {
                 "https://huggingface.co/mistralai/Ministral-3-3B-Instruct-2512-GGUF/resolve/main/Ministral-3-3B-Instruct-2512-Q4_K_M.gguf"
             }
+            PolishModel::Ministral14B => {
+                "https://huggingface.co/unsloth/Ministral-3-14B-Instruct-2512-GGUF/resolve/main/Ministral-3-14B-Instruct-2512-Q4_K_M.gguf"
+            }
             PolishModel::Qwen3_4B => {
                 "https://huggingface.co/unsloth/Qwen3-4B-GGUF/resolve/main/Qwen3-4B-Q4_K_M.gguf"
+            }
+            PolishModel::Qwen3_8B => {
+                "https://huggingface.co/unsloth/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf"
             }
             PolishModel::Unknown => {
                 "https://huggingface.co/unsloth/Phi-4-mini-instruct-GGUF/resolve/main/Phi-4-mini-instruct-Q4_K_M.gguf"
@@ -183,7 +196,9 @@ impl PolishModel {
         match self {
             PolishModel::Phi4Mm => "Phi 4 Mini",
             PolishModel::Ministral3B => "Ministral 3B",
+            PolishModel::Ministral14B => "Ministral 14B",
             PolishModel::Qwen3_4B => "Qwen 3 4B",
+            PolishModel::Qwen3_8B => "Qwen 3 8B",
             PolishModel::Unknown => "Phi 4 Mini",
         }
     }
@@ -192,29 +207,33 @@ impl PolishModel {
         match self {
             PolishModel::Phi4Mm => 2_491_874_272,
             PolishModel::Ministral3B => 2_147_023_008,
+            PolishModel::Ministral14B => 8_839_626_342,
             PolishModel::Qwen3_4B => 2_497_281_312,
+            PolishModel::Qwen3_8B => 5_402_124_288,
             PolishModel::Unknown => 2_491_874_272,
         }
     }
 
     pub fn description(&self) -> &'static str {
         match self {
-            PolishModel::Phi4Mm => "Best for English and general use",
-            PolishModel::Ministral3B => "Excellent for European languages",
-            PolishModel::Qwen3_4B => "Best for Chinese (Mandarin)",
-            PolishModel::Unknown => "Best for English and general use",
+            PolishModel::Phi4Mm => "Fast, strong math & logic (English)",
+            PolishModel::Ministral3B => "Lightest, good multilingual basics",
+            PolishModel::Ministral14B => "Best quality, strong reasoning",
+            PolishModel::Qwen3_4B => "Best for Chinese, lightweight",
+            PolishModel::Qwen3_8B => "Strongest Chinese & reasoning",
+            PolishModel::Unknown => "Fast, strong math & logic (English)",
         }
     }
 
     pub fn all() -> &'static [PolishModel] {
-        &[PolishModel::Phi4Mm, PolishModel::Ministral3B, PolishModel::Qwen3_4B]
+        &[PolishModel::Phi4Mm, PolishModel::Ministral3B, PolishModel::Ministral14B, PolishModel::Qwen3_4B, PolishModel::Qwen3_8B]
     }
 
     fn eos_token(&self) -> &'static str {
         match self {
             PolishModel::Phi4Mm | PolishModel::Unknown => "<|end|>",
-            PolishModel::Ministral3B => "</s>",
-            PolishModel::Qwen3_4B => "<|im_end|>",
+            PolishModel::Ministral3B | PolishModel::Ministral14B => "</s>",
+            PolishModel::Qwen3_4B | PolishModel::Qwen3_8B => "<|im_end|>",
         }
     }
 
@@ -224,7 +243,9 @@ impl PolishModel {
         match self {
             PolishModel::Phi4Mm | PolishModel::Unknown => Some("phi4_mini_tokenizer.json"),
             PolishModel::Qwen3_4B => Some("qwen3_4b_tokenizer.json"),
+            PolishModel::Qwen3_8B => Some("qwen3_8b_tokenizer.json"),
             PolishModel::Ministral3B => Some("ministral3b_tokenizer.json"),
+            PolishModel::Ministral14B => Some("ministral14b_tokenizer.json"),
         }
     }
 
@@ -237,8 +258,14 @@ impl PolishModel {
             PolishModel::Qwen3_4B => Some(
                 "https://huggingface.co/Qwen/Qwen3-4B/resolve/main/tokenizer.json",
             ),
+            PolishModel::Qwen3_8B => Some(
+                "https://huggingface.co/Qwen/Qwen3-8B/resolve/main/tokenizer.json",
+            ),
             PolishModel::Ministral3B => Some(
                 "https://huggingface.co/mistralai/Ministral-3-3B-Instruct-2512/resolve/main/tokenizer.json",
+            ),
+            PolishModel::Ministral14B => Some(
+                "https://huggingface.co/mistralai/Ministral-3-14B-Instruct-2512/resolve/main/tokenizer.json",
             ),
         }
     }
@@ -274,12 +301,45 @@ pub struct PolishModelInfo {
     pub file_size_on_disk: u64,
     pub is_active: bool,
     pub recommended: bool,
+    /// Hardware compatibility: "compatible", "tight", or "incompatible".
+    pub compatibility: String,
 }
 
 impl PolishModelInfo {
-    pub fn from_model(model: &PolishModel, active_model: &PolishModel, recommended_model: &PolishModel) -> Self {
+    pub fn from_model(
+        model: &PolishModel,
+        active_model: &PolishModel,
+        recommended_model: &PolishModel,
+        system: &crate::whisper_models::SystemInfo,
+    ) -> Self {
         let dir = crate::settings::models_dir();
         let (downloaded, file_size_on_disk) = model_file_status(&dir, model);
+
+        // Compute hardware compatibility
+        let effective_memory = if system.is_apple_silicon {
+            system.total_ram_bytes
+        } else if system.has_cuda && system.gpu_vram_bytes >= 2_147_483_648 {
+            system.gpu_vram_bytes
+        } else {
+            system.total_ram_bytes
+        };
+        let overhead: u64 = if system.is_apple_silicon {
+            4_294_967_296 // 4 GB for OS + apps (unified memory)
+        } else if system.has_cuda {
+            536_870_912 // 0.5 GB GPU driver overhead
+        } else {
+            4_294_967_296 // 4 GB for OS + apps
+        };
+        let available = effective_memory.saturating_sub(overhead);
+        let required = (model.size_bytes() as f64 * 1.2) as u64;
+        let compatibility = if required <= available {
+            "compatible"
+        } else if required <= effective_memory {
+            "tight"
+        } else {
+            "incompatible"
+        };
+
         Self {
             id: model.clone(),
             display_name: model.display_name(),
@@ -289,6 +349,7 @@ impl PolishModelInfo {
             file_size_on_disk,
             is_active: model == active_model,
             recommended: model == recommended_model,
+            compatibility: compatibility.to_string(),
         }
     }
 }
@@ -373,10 +434,10 @@ fn format_chat_prompt(model: &PolishModel, system: &str, user: &str) -> String {
             "<|user|>\n{user}\n\n{system}<|end|>\n\
              <|assistant|>\n"
         ),
-        PolishModel::Ministral3B => format!(
+        PolishModel::Ministral3B | PolishModel::Ministral14B => format!(
             "<s>[INST] {user}\n\n{system} [/INST]"
         ),
-        PolishModel::Qwen3_4B => format!(
+        PolishModel::Qwen3_4B | PolishModel::Qwen3_8B => format!(
             // Pre-fill empty <think></think> so the model skips thinking mode.
             "<|im_start|>user\n{user}\n\n{system}<|im_end|>\n\
              <|im_start|>assistant\n<think>\n\n</think>\n\n"
@@ -1476,9 +1537,17 @@ fn ensure_llm_loaded(
                 crate::models::mistral3::ModelWeights::from_gguf(content, &mut file, &device)
                     .map_err(|e| format!("Load Ministral3B: {}", e))?,
             ),
+            PolishModel::Ministral14B => QuantizedModel::Ministral3B(
+                crate::models::mistral3::ModelWeights::from_gguf(content, &mut file, &device)
+                    .map_err(|e| format!("Load Ministral14B: {}", e))?,
+            ),
             PolishModel::Qwen3_4B => QuantizedModel::Qwen3(
                 candle_transformers::models::quantized_qwen3::ModelWeights::from_gguf(content, &mut file, &device)
                     .map_err(|e| format!("Load Qwen3_4B: {}", e))?,
+            ),
+            PolishModel::Qwen3_8B => QuantizedModel::Qwen3(
+                candle_transformers::models::quantized_qwen3::ModelWeights::from_gguf(content, &mut file, &device)
+                    .map_err(|e| format!("Load Qwen3_8B: {}", e))?,
             ),
             PolishModel::Unknown => {
                 return Err("Unknown polish model — please select a model in Settings → Polish".to_string());

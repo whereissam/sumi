@@ -537,9 +537,11 @@
     polishModelsLoading = true;
     try {
       polishModels = await listPolishModels();
-      // Pre-select first available model
-      if (!polishModels.find(m => m.id === selectedPolishModel)) {
-        selectedPolishModel = polishModels.find(m => m.recommended)?.id ?? polishModels[0]?.id ?? 'phi4_mini';
+      // Pre-select first available compatible model
+      const compat = polishModels.filter(m => m.compatibility !== 'incompatible');
+      const current = compat.find(m => m.id === selectedPolishModel);
+      if (!current) {
+        selectedPolishModel = compat.find(m => m.recommended)?.id ?? compat[0]?.id ?? 'phi4_mini';
       }
     } catch {
       polishModels = [];
@@ -1180,7 +1182,7 @@
             <div class="setup-panel-desc">{t('setup.polishLocalDesc')}</div>
 
             <div class="setup-model-list">
-              {#each polishModels as model (model.id)}
+              {#each polishModels.filter(m => m.compatibility !== 'incompatible') as model (model.id)}
                 <button
                   class="setup-model-row"
                   class:selected={selectedPolishModel === model.id}

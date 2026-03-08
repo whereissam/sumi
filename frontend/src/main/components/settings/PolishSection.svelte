@@ -228,15 +228,16 @@
               {@const isActive = model.id === polishConfig.model}
               {@const isDownloading = downloadingModelId === model.id}
               <!-- svelte-ignore a11y_no_static_element_interactions -->
+              {@const isIncompat = model.compatibility === 'incompatible'}
               <div
                 class="model-row"
                 class:active={isActive}
-                class:disabled={!model.downloaded && !isDownloading}
-                onclick={() => model.downloaded && onSelectModel(model.id)}
-                onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); model.downloaded && onSelectModel(model.id); } }}
+                class:disabled={isIncompat || (!model.downloaded && !isDownloading)}
+                onclick={() => !isIncompat && model.downloaded && onSelectModel(model.id)}
+                onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); !isIncompat && model.downloaded && onSelectModel(model.id); } }}
                 role="radio"
                 aria-checked={isActive}
-                tabindex="0"
+                tabindex={isIncompat ? -1 : 0}
               >
                 <!-- Radio indicator -->
                 <div class="model-radio" class:checked={isActive}>
@@ -249,9 +250,31 @@
                 <div class="model-info">
                   <div class="model-name-row">
                     <span class="model-name">{t(`polishModel.${camelCase(model.id)}.name`)}</span>
+                    <span
+                      class="compat-badge"
+                      class:compat-ok={model.compatibility === 'compatible'}
+                      class:compat-tight={model.compatibility === 'tight'}
+                      class:compat-bad={model.compatibility === 'incompatible'}
+                      title={model.compatibility === 'compatible'
+                        ? t('model.compat.ok')
+                        : model.compatibility === 'tight'
+                          ? t('model.compat.tight')
+                          : t('model.compat.bad')}
+                    >
+                      {#if model.compatibility === 'incompatible'}
+                        <svg class="compat-icon" viewBox="0 0 16 16" fill="none">
+                          <path d="M4.5 4.5L11.5 11.5M11.5 4.5L4.5 11.5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                        </svg>
+                      {:else}
+                        <svg class="compat-icon" viewBox="0 0 20 20" fill="none">
+                          <polygon points="10,0.5 11.9,2.8 14.8,1.8 15.3,4.7 18.2,5.3 17.2,8.1 19.5,10 17.2,11.9 18.2,14.8 15.3,15.3 14.8,18.2 11.9,17.2 10,19.5 8.1,17.2 5.3,18.2 4.7,15.3 1.8,14.8 2.8,11.9 0.5,10 2.8,8.1 1.8,5.3 4.7,4.7 5.3,1.8 8.1,2.8" fill="currentColor"/>
+                          <path d="M6.5 10L9 12.5L13.5 7" stroke="white" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+                        </svg>
+                      {/if}
+                      <span class="compat-size">{formatSize(model.size_bytes)}</span>
+                    </span>
                   </div>
                   <div class="model-desc">{t(`polishModel.${camelCase(model.id)}.desc`)}</div>
-                  <div class="model-size">{formatSize(model.size_bytes)}</div>
                 </div>
 
                 <!-- Action -->
@@ -273,7 +296,7 @@
                     </button>
                   {:else if isDownloading}
                     <span class="model-downloading-label">{Math.round(downloadPercent)}%</span>
-                  {:else}
+                  {:else if !isIncompat}
                     <button
                       class="model-download-btn"
                       onclick={(e) => { e.stopPropagation(); startDownload(model.id); }}
@@ -429,10 +452,38 @@
     margin-top: 1px;
   }
 
-  .model-size {
-    font-size: 11px;
-    color: var(--text-tertiary);
-    margin-top: 1px;
+  .compat-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    padding: 1px 7px 1px 3px;
+    border-radius: 9999px;
+    font-size: 10px;
+    font-weight: 600;
+    line-height: 1;
+    white-space: nowrap;
+    cursor: default;
+  }
+  .compat-ok {
+    color: #34c759;
+    background: rgba(52, 199, 89, 0.12);
+  }
+  .compat-tight {
+    color: #f59e0b;
+    background: rgba(245, 158, 11, 0.12);
+  }
+  .compat-bad {
+    color: #ef4444;
+    background: rgba(239, 68, 68, 0.12);
+  }
+  .compat-icon {
+    width: 14px;
+    height: 14px;
+    flex-shrink: 0;
+  }
+  .compat-size {
+    font-size: 10px;
+    font-weight: 600;
   }
 
   .model-action {
