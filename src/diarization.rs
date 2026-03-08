@@ -2566,8 +2566,7 @@ mod tests {
 //
 // Run with: cargo test diarization::integration -- --ignored
 //
-// Models are loaded from the standard dev model directory
-// (~/.sumi-dev/models/).  Copy or symlink the ONNX files there before running:
+// Models are loaded via settings::models_dir().  Copy or symlink the ONNX files there before running:
 //   speech-turn-detector.onnx   (5.9 MB)
 //   speaker-embedding.onnx      (26.5 MB)
 //
@@ -2641,7 +2640,7 @@ mod integration {
     /// Dump raw model output for the first 10 s of voxconv11 to understand
     /// the actual class distribution — used for diagnosis only.
     #[test]
-    #[ignore = "diagnostic only, requires speech-turn-detector.onnx in ~/.sumi-dev/models/"]
+    #[ignore = "diagnostic only, requires speech-turn-detector.onnx at settings::segmentation_model_path()"]
     fn segmentation_dump_raw_frames_first_10s() {
         use ndarray::{Array1, ArrayViewD, Axis, IxDyn};
 
@@ -2719,7 +2718,7 @@ mod integration {
     /// Verify the segmentation model loads and returns at least 2 speech
     /// sub-segments from the 60-second two-speaker VoxConverse sample.
     #[test]
-    #[ignore = "requires speech-turn-detector.onnx in ~/.sumi-dev/models/"]
+    #[ignore = "requires speech-turn-detector.onnx at settings::segmentation_model_path()"]
     fn segmentation_finds_multiple_speech_segments_in_voxconv() {
         let seg_path = crate::settings::segmentation_model_path();
         assert!(
@@ -2780,7 +2779,7 @@ mod integration {
     /// Verify the segmentation model detects intra-utterance speaker changes
     /// (not just silence-bounded segments) in the test1.wav file.
     #[test]
-    #[ignore = "requires speech-turn-detector.onnx in ~/.sumi-dev/models/"]
+    #[ignore = "requires speech-turn-detector.onnx at settings::segmentation_model_path()"]
     fn segmentation_detects_speaker_class_changes_within_speech() {
         let seg_path = crate::settings::segmentation_model_path();
         assert!(seg_path.exists());
@@ -2819,7 +2818,7 @@ mod integration {
 
     /// Verify WeSpeaker ResNet34-LM produces non-zero 256-dim embeddings from real speech.
     #[test]
-    #[ignore = "requires speaker-embedding.onnx in ~/.sumi-dev/models/"]
+    #[ignore = "requires speaker-embedding.onnx at settings::diarization_model_path()"]
     fn wespeaker_produces_256_dim_embedding() {
         let emb_path = crate::settings::diarization_model_path();
         assert!(emb_path.exists(), "WeSpeaker model not found: {}", emb_path.display());
@@ -2854,7 +2853,7 @@ mod integration {
     /// Pre-requisite:
     ///   ffmpeg -i ~/Desktop/kkshow.m4a -ar 16000 -ac 1 /tmp/kkshow_16k.wav
     #[test]
-    #[ignore = "requires both ONNX models in ~/.sumi-dev/models/ + /tmp/kkshow_16k.wav"]
+    #[ignore = "requires both ONNX models at settings::models_dir() + /tmp/kkshow_16k.wav"]
     fn full_pipeline_detects_two_speakers_in_voxconv() {
         let emb_path = crate::settings::diarization_model_path();
         let seg_path = crate::settings::segmentation_model_path();
@@ -3202,8 +3201,8 @@ mod integration {
     ///
     /// Pre-requisites:
     ///   ffmpeg -i ~/Desktop/kkshow.m4a -ar 16000 -ac 1 /tmp/kkshow_16k.wav
-    ///   ONNX models in ~/.sumi-dev/models/
-    ///   Whisper model: ~/.sumi-dev/models/ggml-large-v3-turbo-q5_0.bin
+    ///   ONNX models at settings::segmentation_model_path() and settings::diarization_model_path()
+    ///   Whisper model: settings::models_dir()/ggml-large-v3-turbo-q5_0.bin
     #[test]
     #[ignore = "integration: requires ONNX models + /tmp/kkshow_16k.wav + Whisper model"]
     fn kkshow_full_transcript() {
@@ -3214,8 +3213,8 @@ mod integration {
 
         let emb_path = crate::settings::diarization_model_path();
         let seg_path = crate::settings::segmentation_model_path();
-        let model_path = std::path::PathBuf::from(std::env::var("HOME").unwrap())
-            .join(".sumi-dev/models/ggml-large-v3-turbo-q5_0.bin");
+        let model_path = crate::settings::models_dir()
+            .join(crate::whisper_models::WhisperModel::LargeV3TurboQ5.filename());
 
         assert!(emb_path.exists(), "WeSpeaker model not found: {}", emb_path.display());
         assert!(seg_path.exists(), "Segmentation model not found: {}", seg_path.display());
@@ -3432,8 +3431,8 @@ mod integration {
     ///   ffmpeg -i ~/Desktop/kkshow.m4a       -ar 16000 -ac 1 /tmp/kkshow_16k.wav
     ///   ffmpeg -i ~/Desktop/test_video_1.m4a -ar 16000 -ac 1 /tmp/test_video_1_16k.wav
     ///   ffmpeg -i ~/Desktop/test_video_2.m4a -ar 16000 -ac 1 /tmp/test_video_2_16k.wav
-    ///   ONNX models in ~/.sumi-dev/models/
-    ///   Whisper model: ~/.sumi-dev/models/ggml-large-v3-turbo-q5_0.bin
+    ///   ONNX models at settings::segmentation_model_path() and settings::diarization_model_path()
+    ///   Whisper model: settings::models_dir()/ggml-large-v3-turbo-q5_0.bin
     ///   Python reference (optional): set SUMI_PY_REF env var to results_onnx.txt path
     #[test]
     #[ignore = "integration: requires ONNX models + 3× /tmp/*_16k.wav + Whisper model"]
@@ -3445,8 +3444,8 @@ mod integration {
 
         let emb_path = crate::settings::diarization_model_path();
         let seg_path = crate::settings::segmentation_model_path();
-        let model_path = std::path::PathBuf::from(std::env::var("HOME").unwrap())
-            .join(".sumi-dev/models/ggml-large-v3-turbo-q5_0.bin");
+        let model_path = crate::settings::models_dir()
+            .join(crate::whisper_models::WhisperModel::LargeV3TurboQ5.filename());
 
         for p in [emb_path.as_path(), seg_path.as_path(), model_path.as_path()] {
             assert!(p.exists(), "required file not found: {}", p.display());
@@ -3801,8 +3800,8 @@ mod integration {
 
         let emb_path = crate::settings::diarization_model_path();
         let seg_path = crate::settings::segmentation_model_path();
-        let model_path = std::path::PathBuf::from(std::env::var("HOME").unwrap())
-            .join(".sumi-dev/models/ggml-large-v3-turbo-q5_0.bin");
+        let model_path = crate::settings::models_dir()
+            .join(crate::whisper_models::WhisperModel::LargeV3TurboQ5.filename());
 
         for p in [emb_path.as_path(), seg_path.as_path(), model_path.as_path()] {
             assert!(p.exists(), "required file missing: {}", p.display());

@@ -968,7 +968,7 @@ mod tests {
     /// np.random.seed(0) → test_emb = np.random.randn(256).astype(np.float32)
     /// ```
     #[test]
-    #[ignore] // requires ~/.sumi-dev/models/plda.bin
+    #[ignore] // requires plda.bin at settings::plda_model_path()
     fn plda_real_transform_matches_python() {
         let path = crate::settings::plda_model_path();
         if !path.exists() {
@@ -1022,7 +1022,7 @@ mod tests {
     /// Reference data from `scripts/gen_vbx_crossval.py` (seed=42, 10 embeddings,
     /// 2 speakers). Reads `vbx_crossval.json` from project root.
     #[test]
-    #[ignore] // requires vbx_crossval.json + ~/.sumi-dev/models/plda.bin
+    #[ignore] // requires vbx_crossval.json + plda.bin at settings::plda_model_path()
     fn vbx_full_pipeline_matches_python() {
         let plda_path = crate::settings::plda_model_path();
         if !plda_path.exists() {

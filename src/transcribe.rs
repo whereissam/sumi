@@ -31,18 +31,13 @@ pub struct VadContextCache {
 // and is_processing AtomicBool ensures single-threaded access.
 unsafe impl Send for VadContextCache {}
 
-/// Return the expected path for the Silero VAD model.
-pub fn vad_model_path() -> PathBuf {
-    models_dir().join("ggml-silero-v6.2.0.bin")
-}
-
 /// Filter audio samples through Silero VAD, returning only speech segments.
 /// The VAD context is lazily loaded on first call.
 pub fn filter_with_vad(
     vad_cache: &Mutex<Option<VadContextCache>>,
     samples_16k: &[f32],
 ) -> Result<Vec<f32>, String> {
-    let model_path = vad_model_path();
+    let model_path = crate::settings::vad_model_path();
     if !model_path.exists() {
         return Err("VAD model not downloaded".to_string());
     }
@@ -125,7 +120,7 @@ pub fn has_speech_vad(
     samples_16k: &[f32],
     rms_fallback_threshold: f32,
 ) -> bool {
-    let model_path = vad_model_path();
+    let model_path = crate::settings::vad_model_path();
     if !model_path.exists() {
         return crate::audio::rms(samples_16k) >= rms_fallback_threshold;
     }

@@ -17,15 +17,17 @@
 
   let currentPath = $state<string | null>(null);
 
-  // Migration dialog
+  // New-folder confirmation dialog
   let showMigrateDialog = $state(false);
   let pendingPath = $state('');
   let alreadyHasData = $state(false);
   let noSpaceError = $state(false);
 
-  // Progress modal
+  // Reset confirmation dialog
+  let showResetDialog = $state(false);
+
+  // Progress modal (blocks all interaction during copy+delete)
   let showProgress = $state(false);
-  let progressPhase = $state('');
   let progressBytes = $state(0);
   let progressTotal = $state(0);
 
@@ -42,7 +44,6 @@
   });
 
   function onProgress(p: DataRootMigrationProgress) {
-    progressPhase = p.phase;
     progressBytes = p.bytes_done;
     progressTotal = p.bytes_total;
     if (p.phase === 'done') {
@@ -60,15 +61,7 @@
     const check = await checkDataRootTarget(selected).catch(() => null);
     if (!check) return;
 
-    if (!check.has_enough_space) {
-      noSpaceError = true;
-      pendingPath = selected;
-      alreadyHasData = check.already_has_data;
-      showMigrateDialog = true;
-      return;
-    }
-
-    noSpaceError = false;
+    noSpaceError = !check.has_enough_space;
     pendingPath = selected;
     alreadyHasData = check.already_has_data;
     showMigrateDialog = true;
@@ -76,11 +69,13 @@
 
   // ── Migration actions ─────────────────────────────────────────────────────
 
-  async function doMigrate(strategy: 'move' | 'change_only') {
+  async function doMigrate() {
     showMigrateDialog = false;
-    if (strategy === 'move') showProgress = true;
+    showProgress = true;
+    progressBytes = 0;
+    progressTotal = 0;
     try {
-      await migrateDataRoot(pendingPath, strategy);
+      await migrateDataRoot(pendingPath, 'move');
       currentPath = pendingPath;
     } catch (e: unknown) {
       showProgress = false;
@@ -91,13 +86,21 @@
     }
   }
 
-  async function handleReset() {
+  async function doReset() {
+    showResetDialog = false;
+    showProgress = true;
+    progressBytes = 0;
+    progressTotal = 0;
     errorMsg = '';
     try {
       await migrateDataRoot(null, 'reset');
       currentPath = null;
     } catch (e: unknown) {
-      errorMsg = String(e);
+      showProgress = false;
+      const raw = String(e);
+      if (raw === 'recording_active') errorMsg = t('settings.storage.err.recording');
+      else if (raw === 'meeting_active') errorMsg = t('settings.storage.err.meeting');
+      else errorMsg = t('settings.storage.err.generic').replace('{msg}', raw);
     }
   }
 
@@ -133,7 +136,7 @@
           {t('settings.storage.choose')}
         </button>
         {#if currentPath}
-          <button class="action-btn secondary" onclick={handleReset}>
+          <button class="action-btn secondary" onclick={() => (showResetDialog = true)}>
             {t('settings.storage.reset')}
           </button>
         {/if}
@@ -146,7 +149,7 @@
   {/if}
 </div>
 
-<!-- ── Migration dialog ───────────────────────────────────────────────────── -->
+<!-- ── New-folder confirmation dialog ────────────────────────────────────── -->
 {#if showMigrateDialog}
   <div class="modal-overlay">
     <div class="modal-backdrop" role="presentation" onclick={() => (showMigrateDialog = false)}></div>
@@ -160,25 +163,39 @@
         <p class="warn-msg">{t('settings.storage.migrate.alreadyHasData')}</p>
       {/if}
 
-      <div class="modal-options">
-        <button class="option-btn" disabled={noSpaceError} onclick={() => doMigrate('move')}>
-          <span class="opt-label">{t('settings.storage.migrate.move')}</span>
-          <span class="opt-desc">{t('settings.storage.migrate.moveDesc')}</span>
+      <div class="modal-actions">
+        <button class="confirm-btn" disabled={noSpaceError} onclick={doMigrate}>
+          {t('settings.storage.migrate.confirm')}
         </button>
-        <button class="option-btn" onclick={() => doMigrate('change_only')}>
-          <span class="opt-label">{t('settings.storage.migrate.changeOnly')}</span>
-          <span class="opt-desc">{t('settings.storage.migrate.changeOnlyDesc')}</span>
+        <button class="cancel-btn" onclick={() => (showMigrateDialog = false)}>
+          {t('settings.storage.migrate.cancel')}
         </button>
       </div>
-
-      <button class="cancel-btn" onclick={() => (showMigrateDialog = false)}>
-        {t('settings.storage.migrate.cancel')}
-      </button>
     </div>
   </div>
 {/if}
 
-<!-- ── Progress modal ─────────────────────────────────────────────────────── -->
+<!-- ── Reset confirmation dialog ─────────────────────────────────────────── -->
+{#if showResetDialog}
+  <div class="modal-overlay">
+    <div class="modal-backdrop" role="presentation" onclick={() => (showResetDialog = false)}></div>
+    <div class="modal">
+      <h2 class="modal-title">{t('settings.storage.reset.title')}</h2>
+      <p class="modal-msg">{t('settings.storage.reset.message')}</p>
+
+      <div class="modal-actions">
+        <button class="confirm-btn" onclick={doReset}>
+          {t('settings.storage.reset.confirm')}
+        </button>
+        <button class="cancel-btn" onclick={() => (showResetDialog = false)}>
+          {t('settings.storage.migrate.cancel')}
+        </button>
+      </div>
+    </div>
+  </div>
+{/if}
+
+<!-- ── Progress modal (blocking) ──────────────────────────────────────────── -->
 {#if showProgress}
   <div class="modal-overlay">
     <div class="modal-backdrop" role="presentation"></div>
@@ -311,47 +328,33 @@
     line-height: 1.4;
   }
 
-  .modal-options {
+  .modal-actions {
     display: flex;
     flex-direction: column;
     gap: 8px;
-    margin-bottom: 14px;
   }
 
-  .option-btn {
-    display: flex;
-    flex-direction: column;
-    align-items: flex-start;
-    padding: 12px 14px;
-    border: 1px solid var(--border-default);
-    border-radius: var(--radius-sm);
-    background: var(--bg-secondary);
-    cursor: pointer;
-    text-align: left;
-    transition: background 0.15s, border-color 0.15s;
-    gap: 3px;
+  .confirm-btn {
     width: 100%;
-  }
-
-  .option-btn:hover:not(:disabled) {
-    background: var(--bg-hover);
-    border-color: var(--accent-blue);
-  }
-
-  .option-btn:disabled {
-    opacity: 0.4;
-    cursor: not-allowed;
-  }
-
-  .opt-label {
+    padding: 10px 14px;
+    border: none;
+    border-radius: var(--radius-sm);
+    background: var(--accent-blue);
+    color: #fff;
+    font-family: 'Inter', sans-serif;
     font-size: 13px;
     font-weight: 500;
-    color: var(--text-primary);
+    cursor: pointer;
+    transition: opacity 0.15s;
   }
 
-  .opt-desc {
-    font-size: 11px;
-    color: var(--text-secondary);
+  .confirm-btn:hover:not(:disabled) {
+    opacity: 0.85;
+  }
+
+  .confirm-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
   }
 
   .cancel-btn {

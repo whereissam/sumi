@@ -359,7 +359,7 @@ export const getDataRoot = () => invoke<string | null>('get_data_root');
 export const checkDataRootTarget = (newPath: string) =>
   invoke<DataRootCheckResult>('check_data_root_target', { newPath });
 
-export const migrateDataRoot = (newPath: string | null, strategy: 'move' | 'change_only' | 'reset') =>
+export const migrateDataRoot = (newPath: string | null, strategy: 'move' | 'reset') =>
   invoke<void>('migrate_data_root', { newPath, strategy });
 
 export const onDataRootMigrationProgress = (

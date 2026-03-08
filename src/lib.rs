@@ -768,9 +768,9 @@ fn cleanup_obsolete_models(models_dir: &std::path::Path) {
     }
 
     // VAD model — derive filename from the canonical path so it stays in sync
-    // automatically when the version is bumped in transcribe::vad_model_path().
+    // automatically when the version is bumped in settings::vad_model_path().
     let vad_filename_owned;
-    if let Some(name) = transcribe::vad_model_path()
+    if let Some(name) = settings::vad_model_path()
         .file_name()
         .and_then(|n| n.to_str())
     {
@@ -1198,7 +1198,7 @@ pub fn run() {
                     .unwrap_or_default();
                 if current_model == whisper_models::WhisperModel::LargeV3Turbo {
                     let default_path = models_dir().join(whisper_models::WhisperModel::LargeV3Turbo.filename());
-                    let legacy_path = models_dir().join("ggml-large-v3-turbo-zh-TW.bin");
+                    let legacy_path = models_dir().join(whisper_models::WhisperModel::LargeV3TurboZhTw.filename());
                     if !default_path.exists() && legacy_path.exists() {
                         tracing::info!("Migrating whisper model setting: LargeV3Turbo → LargeV3TurboZhTw (legacy file exists)");
                         if let Ok(mut guard) = state.settings.lock() {

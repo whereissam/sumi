@@ -165,6 +165,10 @@ pub fn plda_model_path() -> PathBuf {
     models_dir().join("plda.bin")
 }
 
+pub fn vad_model_path() -> PathBuf {
+    models_dir().join("ggml-silero-v6.2.0.bin")
+}
+
 pub fn settings_path() -> PathBuf {
     config_dir().join("settings.json")
 }

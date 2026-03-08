@@ -979,7 +979,7 @@ pub struct ModelStatus {
 #[tauri::command]
 pub fn check_model_status() -> ModelStatus {
     let model_exists = settings::models_dir()
-        .join("ggml-large-v3-turbo-zh-TW.bin")
+        .join(whisper_models::WhisperModel::LargeV3TurboZhTw.filename())
         .exists();
     ModelStatus {
         engine: "whisper".to_string(),
@@ -994,7 +994,7 @@ pub fn download_model(app: AppHandle) -> Result<(), String> {
     let dir = settings::models_dir();
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
 
-    let model_path = dir.join("ggml-large-v3-turbo-zh-TW.bin");
+    let model_path = dir.join(whisper_models::WhisperModel::LargeV3TurboZhTw.filename());
     if model_path.exists() {
         let _ = app.emit("model-download-progress", serde_json::json!({
             "status": "complete",
@@ -1874,7 +1874,7 @@ pub fn download_whisper_model(app: AppHandle, model: WhisperModel) -> Result<(),
 
 #[tauri::command]
 pub fn check_vad_model_status() -> Result<serde_json::Value, String> {
-    let downloaded = crate::transcribe::vad_model_path().exists();
+    let downloaded = crate::settings::vad_model_path().exists();
     Ok(serde_json::json!({ "downloaded": downloaded }))
 }
 
@@ -1886,7 +1886,7 @@ pub fn download_vad_model(app: AppHandle) -> Result<(), String> {
     let dir = settings::models_dir();
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
 
-    let model_path = crate::transcribe::vad_model_path();
+    let model_path = crate::settings::vad_model_path();
     if model_path.exists() {
         let _ = app.emit(
             "vad-model-download-progress",
@@ -2081,7 +2081,7 @@ pub fn export_diagnostic_log(state: State<'_, AppState>) -> Result<String, Strin
     writeln!(report, "STT Mode: {:?}", s.stt.mode).ok();
     writeln!(report, "Whisper Model: {}", s.stt.whisper_model.display_name()).ok();
     writeln!(report, "Language: {}", s.stt.language).ok();
-    writeln!(report, "VAD: always enabled (model downloaded: {})", crate::transcribe::vad_model_path().exists()).ok();
+    writeln!(report, "VAD: always enabled (model downloaded: {})", crate::settings::vad_model_path().exists()).ok();
     writeln!(report, "Polish: {}", s.polish.enabled).ok();
     writeln!(report, "Polish Mode: {:?}", s.polish.mode).ok();
     writeln!(report, "Auto Paste: {}", s.auto_paste).ok();
@@ -2531,7 +2531,7 @@ pub fn delete_qwen3_asr_model(
 pub fn delete_vad_model(state: State<'_, AppState>) -> Result<u64, String> {
     guard_model_op(&state)?;
 
-    let path = crate::transcribe::vad_model_path();
+    let path = crate::settings::vad_model_path();
     if !path.exists() {
         return Err("VAD model not found".to_string());
     }
@@ -2801,7 +2801,7 @@ pub fn start_infra_downloads(app: AppHandle) {
     // VAD model (~1.6 MB)
     {
         let app2 = app.clone();
-        let vad_path = crate::transcribe::vad_model_path();
+        let vad_path = crate::settings::vad_model_path();
         if !vad_path.exists() {
             std::thread::spawn(move || {
                 download_infra_file(
@@ -2950,7 +2950,7 @@ fn download_infra_file(app: &AppHandle, url: &str, dest: &std::path::Path, model
 
 #[tauri::command]
 pub fn check_infra_models_ready() -> serde_json::Value {
-    let vad = crate::transcribe::vad_model_path().exists();
+    let vad = crate::settings::vad_model_path().exists();
     let seg = settings::segmentation_model_path().exists();
     let emb = settings::diarization_model_path().exists();
     serde_json::json!({
@@ -3328,14 +3328,16 @@ pub fn get_data_root(state: State<'_, AppState>) -> Option<String> {
         .map(|p| p.to_string_lossy().to_string())
 }
 
-/// Migrate (or just update) the data root.
+/// Migrate the data root.
 ///
 /// `strategy`:
-/// - `"move"` — copy all data directories to `new_path`, update settings,
-///   then delete the originals.
-/// - `"change_only"` — only update settings; the user has already moved the
-///   files manually.
-/// - `"reset"` — revert to the default `~/.sumi/` location (new_path ignored).
+/// - `"move"` — copy all data directories from the current location to `new_path`,
+///   update settings, then delete the originals.
+/// - `"reset"` — copy all data directories from the current custom location back to
+///   the default `~/.sumi/` location, update settings, then delete the originals.
+///   `new_path` is ignored for this strategy.
+///
+/// Both strategies follow the same safe sequence: copy → persist settings → delete originals.
 #[tauri::command]
 pub async fn migrate_data_root(
     state: tauri::State<'_, AppState>,
@@ -3352,28 +3354,27 @@ pub async fn migrate_data_root(
         return Err("meeting_active".to_string());
     }
 
-    // "reset" or no path → remove data_root override
-    if strategy == "reset" || new_path.is_none() {
-        let mut s = state.settings.lock().map_err(|e| e.to_string())?;
-        s.data_root = None;
-        settings::set_data_root(None);
-        settings::save_settings_to_disk(&s);
-        return Ok(());
-    }
-
-    let new_root = std::path::PathBuf::from(new_path.unwrap());
     let old_root = settings::data_dir();
 
-    // "change_only" → just write the setting, no file copy
-    if strategy == "change_only" {
-        let mut s = state.settings.lock().map_err(|e| e.to_string())?;
-        s.data_root = Some(new_root.clone());
-        settings::set_data_root(Some(new_root));
-        settings::save_settings_to_disk(&s);
-        return Ok(());
-    }
+    let new_root = if strategy == "reset" {
+        // If already at default, nothing to do.
+        let has_custom = state
+            .settings
+            .lock()
+            .map_err(|e| e.to_string())?
+            .data_root
+            .is_some();
+        if !has_custom {
+            return Ok(());
+        }
+        settings::base_dir()
+    } else {
+        // "move"
+        std::path::PathBuf::from(
+            new_path.ok_or_else(|| "new_path required for move strategy".to_string())?,
+        )
+    };
 
-    // "move" → copy then delete
     // Create target sub-directories
     for sub in &["models", "history", "audio"] {
         std::fs::create_dir_all(new_root.join(sub))
@@ -3402,8 +3403,13 @@ pub async fn migrate_data_root(
     // Persist new setting before deleting originals (safe rollback point)
     {
         let mut s = state.settings.lock().map_err(|e| e.to_string())?;
-        s.data_root = Some(new_root.clone());
-        settings::set_data_root(Some(new_root.clone()));
+        if strategy == "reset" {
+            s.data_root = None;
+            settings::set_data_root(None);
+        } else {
+            s.data_root = Some(new_root.clone());
+            settings::set_data_root(Some(new_root.clone()));
+        }
         settings::save_settings_to_disk(&s);
     }
 

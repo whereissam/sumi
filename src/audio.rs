@@ -532,7 +532,7 @@ pub fn do_stop_recording(
     };
 
     // ── VAD or RMS trimming ─────────────────────────────────────────────
-    if crate::transcribe::vad_model_path().exists() {
+    if crate::settings::vad_model_path().exists() {
         // Use Silero VAD to extract speech segments
         match crate::transcribe::filter_with_vad(&state.vad_ctx, &samples_16k) {
             Ok(speech) if speech.is_empty() => {
