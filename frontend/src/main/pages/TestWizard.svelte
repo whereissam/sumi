@@ -1407,7 +1407,6 @@
 
   .test-polish-demo-raw {
     padding: 14px 16px;
-    background: #f8f8f8;
   }
 
   .test-polish-demo-polished {
