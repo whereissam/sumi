@@ -621,54 +621,59 @@ fn run_import_inner(app: &AppHandle, file_path: &str) -> Result<String, String> 
     );
 
     // ── Phase 2: Diarization on full file (progress 70–95%) ──
-    let emb_path = settings::diarization_model_path();
-    let seg_path = settings::segmentation_model_path();
-    let diar_segs: Vec<(f64, f64, String)> = if emb_path.exists() && seg_path.exists() {
-        if state.import_cancelled.load(Ordering::SeqCst) {
-            tracing::info!("[import] cancelled by user before diarization");
-            let _ = meeting_notes::delete_note(&history_dir, &note_id);
-            let _ = app.emit("meeting-note-finalized", serde_json::json!({ "id": note_id }));
-            return Err("cancelled".to_string());
-        }
+    #[cfg(feature = "diarization")]
+    let diar_segs: Vec<(f64, f64, String)> = {
+        let emb_path = settings::diarization_model_path();
+        let seg_path = settings::segmentation_model_path();
+        if emb_path.exists() && seg_path.exists() {
+            if state.import_cancelled.load(Ordering::SeqCst) {
+                tracing::info!("[import] cancelled by user before diarization");
+                let _ = meeting_notes::delete_note(&history_dir, &note_id);
+                let _ = app.emit("meeting-note-finalized", serde_json::json!({ "id": note_id }));
+                return Err("cancelled".to_string());
+            }
 
-        match crate::diarization::DiarizationEngine::new(&emb_path, Some(&seg_path)) {
-            Ok(mut engine) => {
-                tracing::info!("[import] diarization engine loaded");
-                let _ = app.emit(
-                    "import-progress",
-                    serde_json::json!({ "status": "diarizing", "progress": 0.7 }),
-                );
-                let app_c = app.clone();
-                let segs = engine.diarize_full(&samples_16k, Some(&move |done, total| {
-                    // Map diarization progress to 70–95%.
-                    let p = 0.7 + (done as f64 / total as f64) * 0.25;
-                    let _ = app_c.emit(
+            match crate::diarization::DiarizationEngine::new(&emb_path, Some(&seg_path)) {
+                Ok(mut engine) => {
+                    tracing::info!("[import] diarization engine loaded");
+                    let _ = app.emit(
                         "import-progress",
-                        serde_json::json!({
-                            "status": "diarizing",
-                            "progress": p,
-                        }),
+                        serde_json::json!({ "status": "diarizing", "progress": 0.7 }),
                     );
-                }));
-                tracing::info!(
-                    "[import] diarization: {} segments, {} speakers",
-                    segs.len(),
-                    segs.iter()
-                        .map(|(_, _, s)| s.as_str())
-                        .collect::<std::collections::HashSet<_>>()
-                        .len()
-                );
-                segs
+                    let app_c = app.clone();
+                    let segs = engine.diarize_full(&samples_16k, Some(&move |done, total| {
+                        // Map diarization progress to 70–95%.
+                        let p = 0.7 + (done as f64 / total as f64) * 0.25;
+                        let _ = app_c.emit(
+                            "import-progress",
+                            serde_json::json!({
+                                "status": "diarizing",
+                                "progress": p,
+                            }),
+                        );
+                    }));
+                    tracing::info!(
+                        "[import] diarization: {} segments, {} speakers",
+                        segs.len(),
+                        segs.iter()
+                            .map(|(_, _, s)| s.as_str())
+                            .collect::<std::collections::HashSet<_>>()
+                            .len()
+                    );
+                    segs
+                }
+                Err(e) => {
+                    tracing::warn!("[import] failed to load diarization engine: {e}");
+                    vec![]
+                }
             }
-            Err(e) => {
-                tracing::warn!("[import] failed to load diarization engine: {e}");
-                vec![]
-            }
+        } else {
+            tracing::info!("[import] diarization models not found, running without speaker labels");
+            vec![]
         }
-    } else {
-        tracing::info!("[import] diarization models not found, running without speaker labels");
-        vec![]
     };
+    #[cfg(not(feature = "diarization"))]
+    let diar_segs: Vec<(f64, f64, String)> = vec![];
 
     // ── Phase 3: Merge ASR + diarization by timestamps (WhisperX-style) ──
     // Rewrite WAL with speaker labels assigned from diarization segments.

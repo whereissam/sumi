@@ -347,6 +347,7 @@ pub(crate) fn run_meeting_feeder_loop(app: tauri::AppHandle, language: String, s
         // Diarization sub-segmentation (segment model + online cluster).
         // guard_model_op rejects delete_diarization_model while meeting_active=true, so
         // holding the lock for the full inference duration is safe: no contention with delete.
+        #[cfg(feature = "diarization")]
         let sub_segs: Vec<(f64, f64, String)> = {
             let mut ctx = state.diarization_ctx.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(ref mut engine) = *ctx {
@@ -356,6 +357,8 @@ pub(crate) fn run_meeting_feeder_loop(app: tauri::AppHandle, language: String, s
                 vec![(start_secs, end_secs, String::new())]
             }
         };
+        #[cfg(not(feature = "diarization"))]
+        let sub_segs: Vec<(f64, f64, String)> = vec![(start_secs, end_secs, String::new())];
 
         // Qwen3-ASR has no word timestamps — STT on full chunk,
         // assign text to the longest (primary) sub-segment.

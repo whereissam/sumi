@@ -443,6 +443,7 @@ pub(crate) fn run_whisper_meeting_feeder_loop(app: AppHandle, language: String, 
         // Returns (start_abs, end_abs, speaker_label) per sub-segment within this chunk.
         // guard_model_op rejects delete_diarization_model while meeting_active=true, so
         // holding the lock for the full inference duration is safe: no contention with delete.
+        #[cfg(feature = "diarization")]
         let sub_segs: Vec<(f64, f64, String)> = {
             let mut ctx = state.diarization_ctx.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(ref mut engine) = *ctx {
@@ -458,6 +459,8 @@ pub(crate) fn run_whisper_meeting_feeder_loop(app: AppHandle, language: String, 
                 vec![(start_secs, end_secs, String::new())]
             }
         };
+        #[cfg(not(feature = "diarization"))]
+        let sub_segs: Vec<(f64, f64, String)> = vec![(start_secs, end_secs, String::new())];
 
         // STT on full chunk (better quality than per-sub-segment due to context).
         let ctx_guard = state.whisper_ctx.lock().unwrap_or_else(|e| e.into_inner());

@@ -2550,6 +2550,13 @@ pub fn delete_vad_model(state: State<'_, AppState>) -> Result<u64, String> {
 
 // ── Diarization Model ──────────────────────────────────────────────────────────
 
+#[cfg(not(feature = "diarization"))]
+#[tauri::command]
+pub fn check_diarization_model_status() -> serde_json::Value {
+    serde_json::json!({ "downloaded": false, "url": "", "file_size_on_disk": 0 })
+}
+
+#[cfg(feature = "diarization")]
 #[tauri::command]
 pub fn check_diarization_model_status() -> serde_json::Value {
     let path = crate::settings::diarization_model_path();
@@ -2566,6 +2573,13 @@ pub fn check_diarization_model_status() -> serde_json::Value {
     })
 }
 
+#[cfg(not(feature = "diarization"))]
+#[tauri::command]
+pub fn download_diarization_model(_app: AppHandle, _state: State<'_, AppState>) -> Result<(), String> {
+    Err("Diarization is not supported on this platform".to_string())
+}
+
+#[cfg(feature = "diarization")]
 #[tauri::command]
 pub fn download_diarization_model(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     use std::io::Read as _;
@@ -2657,6 +2671,7 @@ pub fn delete_diarization_model(state: State<'_, AppState>) -> Result<u64, Strin
 
     let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
 
+    #[cfg(feature = "diarization")]
     if let Ok(mut ctx) = state.diarization_ctx.lock() {
         *ctx = None;
     }
@@ -2668,6 +2683,13 @@ pub fn delete_diarization_model(state: State<'_, AppState>) -> Result<u64, Strin
 
 // ── Segmentation model (pyannote segmentation-3.0.onnx) ──
 
+#[cfg(not(feature = "diarization"))]
+#[tauri::command]
+pub fn check_segmentation_model_status() -> serde_json::Value {
+    serde_json::json!({ "downloaded": false, "url": "", "file_size_on_disk": 0 })
+}
+
+#[cfg(feature = "diarization")]
 #[tauri::command]
 pub fn check_segmentation_model_status() -> serde_json::Value {
     let path = crate::settings::segmentation_model_path();
@@ -2684,6 +2706,13 @@ pub fn check_segmentation_model_status() -> serde_json::Value {
     })
 }
 
+#[cfg(not(feature = "diarization"))]
+#[tauri::command]
+pub fn download_segmentation_model(_app: AppHandle, _state: State<'_, AppState>) -> Result<(), String> {
+    Err("Diarization is not supported on this platform".to_string())
+}
+
+#[cfg(feature = "diarization")]
 #[tauri::command]
 pub fn download_segmentation_model(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     use std::io::Read as _;
@@ -2776,6 +2805,7 @@ pub fn delete_segmentation_model(state: State<'_, AppState>) -> Result<u64, Stri
     let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
 
     // Unload the engine so the next meeting session reloads without segmentation.
+    #[cfg(feature = "diarization")]
     if let Ok(mut ctx) = state.diarization_ctx.lock() {
         *ctx = None;
     }
@@ -2815,6 +2845,7 @@ pub fn start_infra_downloads(app: AppHandle) {
     }
 
     // Segmentation model (~5.9 MB)
+    #[cfg(feature = "diarization")]
     {
         let app2 = app.clone();
         let seg_path = settings::segmentation_model_path();
@@ -2831,6 +2862,7 @@ pub fn start_infra_downloads(app: AppHandle) {
     }
 
     // Embedding model (~26.5 MB)
+    #[cfg(feature = "diarization")]
     {
         let app2 = app.clone();
         let emb_path = settings::diarization_model_path();
@@ -2951,8 +2983,14 @@ fn download_infra_file(app: &AppHandle, url: &str, dest: &std::path::Path, model
 #[tauri::command]
 pub fn check_infra_models_ready() -> serde_json::Value {
     let vad = crate::settings::vad_model_path().exists();
+    #[cfg(feature = "diarization")]
     let seg = settings::segmentation_model_path().exists();
+    #[cfg(not(feature = "diarization"))]
+    let seg = true;
+    #[cfg(feature = "diarization")]
     let emb = settings::diarization_model_path().exists();
+    #[cfg(not(feature = "diarization"))]
+    let emb = true;
     serde_json::json!({
         "ready": vad && seg && emb,
         "vad": vad,

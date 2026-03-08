@@ -559,6 +559,7 @@ pub(crate) fn run_cloud_meeting_feeder_loop(
         // Diarization sub-segmentation (segment model + online cluster).
         // guard_model_op rejects delete_diarization_model while meeting_active=true, so
         // holding the lock for the full inference duration is safe: no contention with delete.
+        #[cfg(feature = "diarization")]
         let sub_segs: Vec<(f64, f64, String)> = {
             let mut ctx = state.diarization_ctx.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(ref mut engine) = *ctx {
@@ -568,6 +569,8 @@ pub(crate) fn run_cloud_meeting_feeder_loop(
                 vec![(start_secs, end_secs, String::new())]
             }
         };
+        #[cfg(not(feature = "diarization"))]
+        let sub_segs: Vec<(f64, f64, String)> = vec![(start_secs, end_secs, String::new())];
 
         let prompt = if prev_text.is_empty() { None } else { Some(prev_text) };
         let text = match run_cloud_stt(&cloud_config, samples, &state.http_client, prompt) {

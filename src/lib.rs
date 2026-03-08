@@ -2,6 +2,7 @@ mod audio;
 mod audio_devices;
 mod audio_import;
 mod commands;
+#[cfg(feature = "diarization")]
 pub mod diarization;
 mod context_detect;
 mod credentials;
@@ -18,6 +19,7 @@ pub mod settings;
 mod whisper_streaming;
 pub mod stt;
 mod transcribe;
+#[cfg(feature = "diarization")]
 mod vbx;
 pub mod whisper_models;
 
@@ -156,6 +158,7 @@ pub struct AppState {
     pub import_cancelled: AtomicBool,
     /// Optional speaker diarization engine (WeSpeaker ONNX).
     /// Loaded at meeting start when diarization model files are present.
+    #[cfg(feature = "diarization")]
     pub diarization_ctx: Mutex<Option<diarization::DiarizationEngine>>,
 }
 
@@ -784,6 +787,7 @@ fn cleanup_obsolete_models(models_dir: &std::path::Path) {
     }
 
     // Diarization infra models (speaker embedding + segmentation).
+    #[cfg(feature = "diarization")]
     let diar_filenames: Vec<String> = [
         settings::diarization_model_path(),
         settings::segmentation_model_path(),
@@ -791,6 +795,8 @@ fn cleanup_obsolete_models(models_dir: &std::path::Path) {
     .iter()
     .filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(str::to_owned))
     .collect();
+    #[cfg(not(feature = "diarization"))]
+    let diar_filenames: Vec<String> = vec![];
     for name in &diar_filenames {
         known_files.insert(name.as_str());
     }
@@ -923,8 +929,12 @@ pub fn run() {
                 let log_dir = logs_dir();
                 let _ = std::fs::create_dir_all(&log_dir);
 
-                // Filter: INFO for everything, WARN+ for ORT (suppresses BFCArena spam).
+                // Filter: INFO for everything, WARN+ for ORT when diarization is enabled
+                // (suppresses BFCArena spam from ONNX Runtime).
+                #[cfg(feature = "diarization")]
                 let ort_filter = tracing_subscriber::EnvFilter::new("info,ort::logging=warn");
+                #[cfg(not(feature = "diarization"))]
+                let ort_filter = tracing_subscriber::EnvFilter::new("info");
 
                 #[cfg(debug_assertions)]
                 {
@@ -1071,6 +1081,7 @@ pub fn run() {
                 last_recording_end: Mutex::new(None),
                 import_active: AtomicBool::new(false),
                 import_cancelled: AtomicBool::new(false),
+                #[cfg(feature = "diarization")]
                 diarization_ctx: Mutex::new(None),
             });
 
@@ -1942,24 +1953,27 @@ fn start_meeting_mode(app: &AppHandle) {
     // Load the speaker diarization engine *outside* the lock so model I/O
     // (2–5 s) does not block concurrent diarization_ctx readers.
     // Load diarization engine if models are present; no explicit enable toggle.
-    let new_diar_engine: Option<diarization::DiarizationEngine> = {
-        let model_path = settings::diarization_model_path();
-        let seg_path = settings::segmentation_model_path();
-        if model_path.exists() && seg_path.exists() {
-            match diarization::DiarizationEngine::new(&model_path, Some(&seg_path)) {
-                Ok(engine) => Some(engine),
-                Err(e) => {
-                    tracing::warn!("[diarization] failed to load model: {e}");
-                    None
+    #[cfg(feature = "diarization")]
+    {
+        let new_diar_engine: Option<diarization::DiarizationEngine> = {
+            let model_path = settings::diarization_model_path();
+            let seg_path = settings::segmentation_model_path();
+            if model_path.exists() && seg_path.exists() {
+                match diarization::DiarizationEngine::new(&model_path, Some(&seg_path)) {
+                    Ok(engine) => Some(engine),
+                    Err(e) => {
+                        tracing::warn!("[diarization] failed to load model: {e}");
+                        None
+                    }
                 }
+            } else {
+                tracing::info!("[diarization] models not found, running meeting without speaker labels");
+                None
             }
-        } else {
-            tracing::info!("[diarization] models not found, running meeting without speaker labels");
-            None
-        }
-    };
-    // Swap in atomically; lock held only for the pointer swap, not model I/O.
-    *state.diarization_ctx.lock().unwrap_or_else(|e| e.into_inner()) = new_diar_engine;
+        };
+        // Swap in atomically; lock held only for the pointer swap, not model I/O.
+        *state.diarization_ctx.lock().unwrap_or_else(|e| e.into_inner()) = new_diar_engine;
+    }
 
     let preferred_device = state.settings.lock().ok().and_then(|s| s.mic_device.clone());
 
@@ -2242,21 +2256,26 @@ fn stop_meeting_mode(app: &AppHandle) {
 
     // Run agglomerative clustering over all buffered embeddings for optimal
     // speaker labels, then update the WAL transcript before writing to SQLite.
-    let final_labels: Vec<(f64, f64, String)> = {
-        let mut diar = state.diarization_ctx.lock().unwrap_or_else(|e| e.into_inner());
-        diar.as_mut()
-            .map(|engine| engine.finalize_labels())
-            .unwrap_or_default()
+    #[cfg(feature = "diarization")]
+    let transcript = {
+        let final_labels: Vec<(f64, f64, String)> = {
+            let mut diar = state.diarization_ctx.lock().unwrap_or_else(|e| e.into_inner());
+            diar.as_mut()
+                .map(|engine| engine.finalize_labels())
+                .unwrap_or_default()
+        };
+        if final_labels.is_empty() {
+            raw_transcript
+        } else {
+            tracing::info!(
+                "[diarization] applying {} agglomerative labels to WAL",
+                final_labels.len()
+            );
+            meeting_notes::update_wal_speakers(&raw_transcript, &final_labels)
+        }
     };
-    let transcript = if final_labels.is_empty() {
-        raw_transcript
-    } else {
-        tracing::info!(
-            "[diarization] applying {} agglomerative labels to WAL",
-            final_labels.len()
-        );
-        meeting_notes::update_wal_speakers(&raw_transcript, &final_labels)
-    };
+    #[cfg(not(feature = "diarization"))]
+    let transcript = raw_transcript;
 
     if let Some(ref id) = note_id {
         if let Err(e) = meeting_notes::finalize_note(&hdir, id, &transcript, duration_secs) {

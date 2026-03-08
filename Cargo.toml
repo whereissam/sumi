@@ -7,8 +7,9 @@ license = "GPL-3.0-or-later"
 
 [features]
 default = ["metal"]
-metal = ["whisper-rs/metal", "candle-core/metal", "candle-nn/metal", "candle-transformers/metal", "qwen3-asr/metal"]
+metal = ["whisper-rs/metal", "candle-core/metal", "candle-nn/metal", "candle-transformers/metal", "qwen3-asr/metal", "diarization"]
 cuda = ["whisper-rs/cuda", "candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda", "qwen3-asr/cuda"]
+diarization = ["dep:ort", "dep:ndarray", "dep:rustfft"]
 
 [dependencies]
 tauri = { version = "2", features = ["tray-icon", "macos-private-api", "image-png"] }
@@ -37,9 +38,9 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["png"] }
 unicode-segmentation = "1.12.0"
-ort = { version = "=2.0.0-rc.10", features = ["ndarray", "coreml"] } # pinned: rc.10 ships bundled static ONNX Runtime; later RCs dropped it, requiring a separate dylib
-ndarray = "0.16"
-rustfft = "6"
+ort = { version = "=2.0.0-rc.10", optional = true, features = ["ndarray", "coreml"] } # pinned: rc.10 ships bundled static ONNX Runtime; later RCs dropped it, requiring a separate dylib; optional to avoid CRT mismatch on Windows CUDA builds
+ndarray = { version = "0.16", optional = true }
+rustfft = { version = "6", optional = true }
 url = "2"
 zhconv = "0.4"
 tracing = "0.1"
