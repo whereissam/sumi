@@ -19,14 +19,15 @@
   // ── Shared state ──
 
   let step = $state(1);
-  const TOTAL_STEPS = 6;
+  const TOTAL_STEPS = 7;
 
   const breadcrumbs = [
     'test.breadcrumb.mic',
     'test.breadcrumb.hotkey',
     'test.breadcrumb.general',
-    'test.breadcrumb.gmail',
     'test.breadcrumb.polishCheck',
+    'test.breadcrumb.gmail',
+    'test.breadcrumb.editHotkey',
     'test.breadcrumb.editByVoice',
   ];
 
@@ -380,42 +381,9 @@
     setContextOverride('', '', '').catch(() => {});
   }
 
-  // ── Step 5: Polish Readiness Check ──
+  // ── Step 4: Polish Readiness Check ──
 
   let polishReady = $state(false);
-  let polishPressedKeys = $state(new Set<string>());
-
-  function polishKeydown(e: KeyboardEvent) {
-    e.preventDefault();
-    const held = eventToHotkeyParts(e);
-    const parts = hotkey.split('+');
-    const newPressed = new Set(polishPressedKeys);
-    parts.forEach((part) => {
-      if (held.has(part)) newPressed.add(part);
-    });
-    polishPressedKeys = newPressed;
-  }
-
-  function polishKeyup(e: KeyboardEvent) {
-    e.preventDefault();
-    const newPressed = new Set(polishPressedKeys);
-    newPressed.delete(e.code);
-    if (!e.altKey) newPressed.delete('Alt');
-    if (!e.ctrlKey) newPressed.delete('Control');
-    if (!e.shiftKey) newPressed.delete('Shift');
-    if (!e.metaKey) newPressed.delete('Super');
-    polishPressedKeys = newPressed;
-  }
-
-  function isPolishKeyPressed(part: string): boolean {
-    return polishPressedKeys.has(part);
-  }
-
-  function cleanupPolishCheck() {
-    document.removeEventListener('keydown', polishKeydown);
-    document.removeEventListener('keyup', polishKeyup);
-    polishPressedKeys = new Set();
-  }
 
   async function checkPolishReady() {
     const pc = getPolishConfig();
@@ -436,9 +404,6 @@
   }
 
   async function setupPolishCheck() {
-    cleanupPolishCheck();
-    document.addEventListener('keydown', polishKeydown);
-    document.addEventListener('keyup', polishKeyup);
     await checkPolishReady();
   }
 
@@ -448,7 +413,49 @@
     setCurrentPage('settings');
   }
 
-  // ── Step 6: Edit by Voice ──
+  // ── Step 6: Edit Hotkey Check ──
+
+  let editHotkeyCheckPressedKeys = $state(new Set<string>());
+
+  function editHotkeyCheckKeydown(e: KeyboardEvent) {
+    e.preventDefault();
+    const held = eventToHotkeyParts(e);
+    const parts = (editHotkey || hotkey).split('+');
+    const newPressed = new Set(editHotkeyCheckPressedKeys);
+    parts.forEach((part) => {
+      if (held.has(part)) newPressed.add(part);
+    });
+    editHotkeyCheckPressedKeys = newPressed;
+  }
+
+  function editHotkeyCheckKeyup(e: KeyboardEvent) {
+    e.preventDefault();
+    const newPressed = new Set(editHotkeyCheckPressedKeys);
+    newPressed.delete(e.code);
+    if (!e.altKey) newPressed.delete('Alt');
+    if (!e.ctrlKey) newPressed.delete('Control');
+    if (!e.shiftKey) newPressed.delete('Shift');
+    if (!e.metaKey) newPressed.delete('Super');
+    editHotkeyCheckPressedKeys = newPressed;
+  }
+
+  function isEditHotkeyCheckPressed(part: string): boolean {
+    return editHotkeyCheckPressedKeys.has(part);
+  }
+
+  function cleanupEditHotkeyCheck() {
+    document.removeEventListener('keydown', editHotkeyCheckKeydown);
+    document.removeEventListener('keyup', editHotkeyCheckKeyup);
+    editHotkeyCheckPressedKeys = new Set();
+  }
+
+  function setupEditHotkeyCheck() {
+    cleanupEditHotkeyCheck();
+    document.addEventListener('keydown', editHotkeyCheckKeydown);
+    document.addEventListener('keyup', editHotkeyCheckKeyup);
+  }
+
+  // ── Step 7: Edit by Voice ──
 
   let editUnlisten: UnlistenFn | null = null;
   let editBody = $state<HTMLElement | null>(null);
@@ -504,9 +511,10 @@
       if (n === 1) setupMicTest();
       else if (n === 2) setupHotkeyTest();
       else if (n === 3) setupGeneral();
-      else if (n === 4) setupGmail();
-      else if (n === 5) setupPolishCheck();
-      else if (n === 6) setupEditTest();
+      else if (n === 4) setupPolishCheck();
+      else if (n === 5) setupGmail();
+      else if (n === 6) setupEditHotkeyCheck();
+      else if (n === 7) setupEditTest();
     });
   }
 
@@ -528,7 +536,7 @@
     cleanupHotkeyTest();
     cleanupGeneral();
     cleanupGmail();
-    cleanupPolishCheck();
+    cleanupEditHotkeyCheck();
     cleanupEditTest();
     setTestMode(false).catch(() => {});
   }
@@ -551,7 +559,6 @@
   // Helper for instruction HTML with embedded keycaps
   let generalInstruction = $derived(t('test.step3.instruction', { hotkey: hotkeyKeycapsHtml(hotkey) }));
   let gmailInstruction = $derived(t('test.step4.instruction', { hotkey: hotkeyKeycapsHtml(hotkey) }));
-  let polishInstruction = $derived(t('test.step5.instruction', { hotkey: hotkeyKeycapsHtml(hotkey) }));
   let editInstruction = $derived(
     t('test.step6.instruction', { hotkey: hotkeyKeycapsHtml(editHotkey || hotkey) }),
   );
@@ -701,12 +708,58 @@
     </div>
   {/if}
 
-  <!-- Step 4: Gmail Scenario -->
+  <!-- Step 4: Polish Readiness Check -->
   {#if step === 4}
     <div class="test-step active">
       <div class="test-layout">
         <div class="test-left">
           <button class="test-back" onclick={() => goBack(4)}>
+            {t('test.back')}
+          </button>
+          <div class="test-left-spacer"></div>
+          <div class="test-title">{t('test.step5.title')}</div>
+          <div class="test-subtitle">{t('test.step5.subtitle')}</div>
+          {#if polishReady}
+            <div class="test-polish-status test-polish-ready">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#28c840" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
+              <span>{t('test.step5.polishReady')}</span>
+            </div>
+            <div class="test-left-spacer"></div>
+            <div class="test-actions">
+              <button class="test-btn-filled" onclick={() => goToStep(5)}>
+                {t('test.step3.next')}
+              </button>
+            </div>
+          {:else}
+            <div class="test-polish-status test-polish-not-ready">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#ff9500" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+              <span>{t('test.step5.polishNotReady')}</span>
+            </div>
+            <div class="test-left-spacer"></div>
+            <div class="test-actions">
+              <button class="test-btn-filled" onclick={navigateToPolishSettings}>
+                {t('test.step5.goToSettings')}
+              </button>
+            </div>
+          {/if}
+        </div>
+        <div class="test-right">
+          {#if polishReady}
+            <svg width="80" height="80" viewBox="0 0 24 24" fill="none" stroke="#28c840" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
+          {:else}
+            <svg width="80" height="80" viewBox="0 0 24 24" fill="none" stroke="#ff9500" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+          {/if}
+        </div>
+      </div>
+    </div>
+  {/if}
+
+  <!-- Step 5: Gmail Scenario -->
+  {#if step === 5}
+    <div class="test-step active">
+      <div class="test-layout">
+        <div class="test-left">
+          <button class="test-back" onclick={() => goBack(5)}>
             {t('test.back')}
           </button>
           <div class="test-left-spacer"></div>
@@ -720,7 +773,7 @@
           <div class="test-sample-text">{t('test.step4.sampleText')}</div>
           <div class="test-left-spacer"></div>
           <div class="test-actions">
-            <button class="test-btn-filled" onclick={() => goToStep(5)}>
+            <button class="test-btn-filled" onclick={() => goToStep(6)}>
               {t('test.step3.next')}
             </button>
           </div>
@@ -767,49 +820,34 @@
     </div>
   {/if}
 
-  <!-- Step 5: Polish Readiness Check -->
-  {#if step === 5}
+  <!-- Step 6: Edit Hotkey Check -->
+  {#if step === 6}
     <div class="test-step active">
       <div class="test-layout">
         <div class="test-left">
-          <button class="test-back" onclick={() => goBack(5)}>
+          <button class="test-back" onclick={() => goBack(6)}>
             {t('test.back')}
           </button>
           <div class="test-left-spacer"></div>
-          <div class="test-title">{t('test.step5.title')}</div>
-          <div class="test-subtitle">{t('test.step5.subtitle')}</div>
-          {#if polishReady}
-            <InstructionCard
-              icon='<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#007AFF" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="2" width="6" height="11" rx="3"/><path d="M5 10a7 7 0 0 0 14 0"/><line x1="12" y1="19" x2="12" y2="22"/></svg>'
-            >
-              <!-- eslint-disable-next-line svelte/no-at-html-tags -->
-              {@html polishInstruction}
-            </InstructionCard>
-            <div class="test-left-spacer"></div>
-            <div class="test-actions">
-              <button class="test-btn-filled" onclick={() => goToStep(6)}>
-                {t('test.step3.next')}
-              </button>
-            </div>
-          {:else}
-            <div class="test-polish-status test-polish-not-ready">
-              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#ff9500" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
-              <span>{t('test.step5.polishNotReady')}</span>
-            </div>
-            <div class="test-left-spacer"></div>
-            <div class="test-actions">
-              <button class="test-btn-filled" onclick={navigateToPolishSettings}>
-                {t('test.step5.goToSettings')}
-              </button>
-            </div>
-          {/if}
+          <div class="test-title">{t('test.step6check.title')}</div>
+          <div class="test-subtitle">{t('test.step6check.subtitle')}</div>
+          <div class="test-question">{t('test.step6check.question')}</div>
+          <div class="test-actions">
+            <button class="test-btn-outline" onclick={finishWizard}>
+              {t('test.step6check.no')}
+            </button>
+            <button class="test-btn-filled" onclick={() => goToStep(7)}>
+              {t('test.step6check.yes')}
+            </button>
+          </div>
+          <div class="test-left-spacer"></div>
         </div>
         <div class="test-right">
           <div class="test-keycap-lg">
-            {#each hotkey.split('+') as part}
+            {#each (editHotkey || hotkey).split('+') as part}
               {@const sym = MODIFIER_SYMBOLS[part]}
               {@const label = sym ?? part.replace(/^Key/, '').replace(/^Digit/, '')}
-              <kbd class:accent={!sym} class:pressed={isPolishKeyPressed(part)}>{label}</kbd>
+              <kbd class:accent={!sym} class:pressed={isEditHotkeyCheckPressed(part)}>{label}</kbd>
             {/each}
           </div>
         </div>
@@ -817,12 +855,12 @@
     </div>
   {/if}
 
-  <!-- Step 6: Edit by Voice -->
-  {#if step === 6}
+  <!-- Step 7: Edit by Voice -->
+  {#if step === 7}
     <div class="test-step active">
       <div class="test-layout">
         <div class="test-left">
-          <button class="test-back" onclick={() => goBack(6)}>
+          <button class="test-back" onclick={() => goBack(7)}>
             {t('test.back')}
           </button>
           <div class="test-left-spacer"></div>
