@@ -383,8 +383,8 @@
 
   // ── Step 4: Polish Readiness Check + Mockup Animation ──
 
-  const MOCKUP_RAW = 'um, I was thinking — maybe we could have lunch tomorrow?';
-  const MOCKUP_POLISHED = 'I was thinking we could have lunch tomorrow.';
+  let mockupRaw = $derived(t('test.step5.mockupRaw'));
+  let mockupPolished = $derived(t('test.step5.mockupPolished'));
   const MOCKUP_TIMINGS = [0, 300, 700, 4200, 5200];
   const MOCKUP_LOOP = 9000;
 
@@ -405,11 +405,11 @@
           mockupDisplayed = '';
           mockupSecs = 0;
           let i = 0;
-          const charDelay = Math.max(20, Math.floor((MOCKUP_TIMINGS[3] - MOCKUP_TIMINGS[2]) / MOCKUP_RAW.length));
+          const charDelay = Math.max(20, Math.floor((MOCKUP_TIMINGS[3] - MOCKUP_TIMINGS[2]) / mockupRaw.length));
           mockupTypeIv = setInterval(() => {
             i++;
-            mockupDisplayed = MOCKUP_RAW.slice(0, i);
-            if (i >= MOCKUP_RAW.length && mockupTypeIv) { clearInterval(mockupTypeIv); mockupTypeIv = null; }
+            mockupDisplayed = mockupRaw.slice(0, i);
+            if (i >= mockupRaw.length && mockupTypeIv) { clearInterval(mockupTypeIv); mockupTypeIv = null; }
           }, charDelay);
           mockupSecsIv = setInterval(() => mockupSecs++, 1000);
         }
@@ -810,13 +810,13 @@
             <div class="mockup-body">
               <!-- Text content -->
               {#if mockupStep === 4}
-                <div class="mockup-text mockup-text-polished">{MOCKUP_POLISHED}</div>
+                <div class="mockup-text mockup-text-polished">{mockupPolished}</div>
               {:else if mockupStep >= 2}
                 <div class="mockup-text mockup-text-raw">
-                  {mockupDisplayed}{#if mockupDisplayed.length < MOCKUP_RAW.length}<span class="mockup-cursor"></span>{/if}
+                  {mockupDisplayed}{#if mockupDisplayed.length < mockupRaw.length}<span class="mockup-cursor"></span>{/if}
                 </div>
               {:else}
-                <div class="mockup-text mockup-text-idle">{MOCKUP_RAW}</div>
+                <div class="mockup-text mockup-text-idle">{mockupRaw}</div>
               {/if}
 
               <!-- Recording / Polishing badge -->
@@ -830,7 +830,6 @@
                     </div>
                     {t('overlay.recording')} {mockupRecordingTime}
                   {:else}
-                    <svg class="mockup-sparkle" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="rgba(255,220,50,0.9)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
                     {t('overlay.polishing')}...
                   {/if}
                 </div>
@@ -1608,15 +1607,6 @@
   @keyframes mockup-wave {
     0%, 100% { transform: scaleY(var(--scale, 0.5)); }
     50%       { transform: scaleY(1.2); }
-  }
-
-  .mockup-sparkle {
-    animation: mockup-pulse 1s ease-in-out infinite;
-  }
-
-  @keyframes mockup-pulse {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.4; }
   }
 
   .mockup-shortcut-hint {

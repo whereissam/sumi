@@ -334,6 +334,8 @@
   "test.step5.polishReady": "AI polishing is configured. Let's test it in Gmail!",
   "test.step5.polishNotReady": "AI polishing is not configured yet. Enable it in Settings to use this feature.",
   "test.step5.goToSettings": "Enable in Settings",
+  "test.step5.mockupRaw": "um, I was thinking — maybe we could have lunch tomorrow?",
+  "test.step5.mockupPolished": "I was thinking we could have lunch tomorrow.",
   "test.breadcrumb.editHotkey": "Edit Shortcut",
   "test.step6check.title": "Edit by Voice Shortcut",
   "test.step6check.subtitle": "Press each key in the shortcut one by one to see them light up.",

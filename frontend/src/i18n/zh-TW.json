@@ -334,6 +334,8 @@
   "test.step5.polishReady": "AI 潤飾已設定完成，接下來在 Gmail 中測試看看吧！",
   "test.step5.polishNotReady": "AI 潤飾尚未設定，請在設定中啟用以使用此功能。",
   "test.step5.goToSettings": "前往設定",
+  "test.step5.mockupRaw": "嗯就是我在想說，我們明天可以一起吃個飯嗎？",
+  "test.step5.mockupPolished": "我想問您明天是否方便一起用餐。",
   "test.breadcrumb.editHotkey": "編輯捷徑",
   "test.step6check.title": "語音編輯捷徑",
   "test.step6check.subtitle": "逐一按下捷徑中的每個按鍵，確認它們都能亮起。",

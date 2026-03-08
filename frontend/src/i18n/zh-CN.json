@@ -334,6 +334,8 @@
   "test.step5.polishReady": "AI 润色已配置完成，接下来在 Gmail 中测试一下吧！",
   "test.step5.polishNotReady": "AI 润色尚未配置，请在设置中启用以使用此功能。",
   "test.step5.goToSettings": "前往设置",
+  "test.step5.mockupRaw": "嗯就是我在想说，我们明天可以一起吃个饭吗？",
+  "test.step5.mockupPolished": "我想问您明天是否方便一起用餐。",
   "test.breadcrumb.editHotkey": "编辑快捷键",
   "test.step6check.title": "语音编辑快捷键",
   "test.step6check.subtitle": "逐一按下快捷键中的每个按键，确认它们都能亮起。",
