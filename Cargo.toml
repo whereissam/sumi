@@ -7,7 +7,7 @@ license = "GPL-3.0-or-later"
 
 [features]
 default = ["metal"]
-metal = ["whisper-rs/metal", "candle-core/metal", "candle-nn/metal", "candle-transformers/metal", "qwen3-asr/metal", "diarization"]
+metal = ["whisper-rs/metal", "candle-core/metal", "candle-nn/metal", "candle-transformers/metal", "qwen3-asr/metal"]
 cuda = ["whisper-rs/cuda", "candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda", "qwen3-asr/cuda"]
 diarization = ["dep:ort", "dep:ndarray", "dep:rustfft"]
 

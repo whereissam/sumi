@@ -2,15 +2,23 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <!-- Required for kSecUseDataProtectionKeychain (no per-app ACL, no password prompts). -->
-    <!-- Both the release and dev bundle IDs are listed so a single file covers all builds. -->
-    <!-- TODO: In a signed distribution build these strings must be prefixed with the Apple  -->
-    <!-- Developer Team ID, e.g. "TEAMID.com.sumivoice.app". The Team ID can be found in    -->
-    <!-- the Apple Developer Portal under Membership Details.                                 -->
+    <!-- Required for WKWebView JavaScript JIT under hardened runtime -->
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+
+    <!-- Microphone access for speech-to-text recording -->
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
+
+    <!-- AppleScript access for browser URL detection (context_detect.rs) -->
+    <key>com.apple.security.automation.apple-events</key>
+    <true/>
+
+    <!-- Data Protection Keychain for API key storage (credentials.rs) -->
     <key>keychain-access-groups</key>
     <array>
-        <string>com.sumivoice.app</string>
-        <string>com.sumivoice.app.dev</string>
+        <string>HZ3F4JWGL9.com.sumivoice.app</string>
+        <string>HZ3F4JWGL9.com.sumivoice.app.dev</string>
     </array>
 </dict>
 </plist>

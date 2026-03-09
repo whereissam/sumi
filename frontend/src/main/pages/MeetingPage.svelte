@@ -716,12 +716,14 @@
                     ? `--spk-color: ${SPEAKER_COLORS[group.speakerIdx % SPEAKER_COLORS.length]}`
                     : ''}
                 >
-                  <div class="speaker-header">
-                    {#if group.speaker}
-                      <span class="speaker-label">{formatSpeaker(group.speaker)}</span>
-                    {/if}
-                    <span class="speaker-ts">{formatSegTime(group.start)}</span>
-                  </div>
+                  {#if hasSpeakers}
+                    <div class="speaker-header">
+                      {#if group.speaker}
+                        <span class="speaker-label">{formatSpeaker(group.speaker)}</span>
+                      {/if}
+                      <span class="speaker-ts">{formatSegTime(group.start)}</span>
+                    </div>
+                  {/if}
                   <p class="speaker-text">{group.text}</p>
                 </div>
               {/each}
@@ -1088,7 +1090,7 @@
     flex-direction: column;
     gap: 4px;
     padding-left: 12px;
-    border-left: 2.5px solid var(--spk-color, var(--border-divider));
+    border-left: 2.5px solid var(--spk-color, transparent);
   }
 
   .speaker-header {
