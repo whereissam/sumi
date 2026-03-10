@@ -42,6 +42,27 @@
     | 'undo'
     | 'switching';
 
+  /** Terminal/short-lived phases where reset on hide is correct.
+   *  'undo' — context-specific; countdown expires intentionally on navigation.
+   *  Adding a new Phase without assigning it to TerminalPhase will cause a
+   *  type error on ACTIVE_PHASES, keeping the two lists in sync.
+   */
+  type TerminalPhase =
+    | 'preparing' | 'pasted' | 'copied' | 'error'
+    | 'edited' | 'edit_requires_polish' | 'meeting_stopped' | 'undo';
+
+  /** Phases actively driven by backend events — do not reset on visibilitychange.
+   *  Note: only 'switching' has a 30s safety timeout; the other active phases
+   *  rely on the backend always emitting a terminal event. If the backend is
+   *  killed mid-phase while the overlay is hidden, the next show may display a
+   *  stale state (low risk — the backend emits 'preparing' before every hide).
+   */
+  const ACTIVE_PHASES: readonly Exclude<Phase, TerminalPhase>[] = [
+    'recording', 'edit_recording', 'meeting_recording',
+    'transcribing', 'polishing', 'processing',
+    'switching', // model-switch in progress; backend owns the 'done' transition
+  ];
+
   let phase: Phase = $state('preparing');
   let timerText: string = $state('0:00');
   let recProgress: number = $state(0);
@@ -451,6 +472,12 @@
   // stale text (like "transcribing") when next shown.
   function handleVisibility() {
     if (document.hidden) {
+      // During active recording/processing, state is driven by backend events.
+      // macOS Space switches briefly fire visibilitychange — skip the reset
+      // so we don't interrupt the current phase.
+      if ((ACTIVE_PHASES as readonly Phase[]).includes(phase)) {
+        return;
+      }
       setPreparing();
     }
   }
