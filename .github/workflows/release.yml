@@ -3,9 +3,19 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g., v0.5.3)"
+        required: true
+        type: string
+      skip_notarize:
+        description: "Skip Apple notarization (keeps Developer ID code signing)"
+        type: boolean
+        default: false
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -25,7 +35,11 @@ jobs:
       - name: Extract tag
         id: tag
         run: |
-          TAG="${GITHUB_REF#refs/tags/}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
           VERSION="${TAG#v}"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
@@ -34,11 +48,17 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "${{ steps.tag.outputs.tag }}" \
-            --repo "${{ github.repository }}" \
-            --title "${{ steps.tag.outputs.tag }}" \
-            --generate-notes \
-            --draft
+          TAG="${{ steps.tag.outputs.tag }}"
+          if gh release view "$TAG" --repo "${{ github.repository }}" &>/dev/null; then
+            echo "Release $TAG already exists, setting back to draft"
+            gh release edit "$TAG" --repo "${{ github.repository }}" --draft
+          else
+            gh release create "$TAG" \
+              --repo "${{ github.repository }}" \
+              --title "$TAG" \
+              --generate-notes \
+              --draft
+          fi
 
   # ── macOS (aarch64, Metal) ────────────────────────────────────────
   build-macos:
@@ -46,6 +66,8 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ needs.create-release.outputs.tag }}
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
@@ -61,7 +83,8 @@ jobs:
         run: npm ci
         working-directory: frontend
 
-      - name: Build Tauri app
+      - name: Build Tauri app (with notarization)
+        if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_notarize }}
         uses: tauri-apps/tauri-action@73fb865345c54760d875b94642314f8c0c894afa # v0.6.1
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -72,6 +95,24 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+          CMAKE_OSX_DEPLOYMENT_TARGET: "11.0"
+          CMAKE_C_FLAGS: "-march=armv8.5-a"
+          CMAKE_CXX_FLAGS: "-march=armv8.5-a"
+        with:
+          args: --target aarch64-apple-darwin
+
+      - name: Build Tauri app (skip notarization)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.skip_notarize }}
+        uses: tauri-apps/tauri-action@73fb865345c54760d875b94642314f8c0c894afa # v0.6.1
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          # APPLE_ID, APPLE_PASSWORD, APPLE_TEAM_ID intentionally omitted
+          # → var_os("APPLE_ID") returns None → notarization skipped
           MACOSX_DEPLOYMENT_TARGET: "11.0"
           CMAKE_OSX_DEPLOYMENT_TARGET: "11.0"
           CMAKE_C_FLAGS: "-march=armv8.5-a"
@@ -110,6 +151,8 @@ jobs:
             artifact-suffix: cuda13
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ needs.create-release.outputs.tag }}
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
